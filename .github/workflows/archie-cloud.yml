@@ -1,0 +1,69 @@
+name: Archie cloud archive
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 23 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r backup_tool/requirements.txt
+
+      - name: Restore previous backup from Dropbox
+        env:
+          DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
+          DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
+          DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
+        run: python backup_tool/dropbox_sync.py download --remote /Archie/latest/archie-backup.zip --output /tmp/archie-backup.zip || true
+
+      - name: Unpack previous backup
+        run: |
+          if [ -f /tmp/archie-backup.zip ]; then
+            mkdir -p backup
+            unzip -q -o /tmp/archie-backup.zip -d backup
+          fi
+
+      - name: Download publicly accessible chapters
+        run: |
+          python backup_tool/backup.py             --start 1             --end 10000             --output backup             --delay 1             --max-pages 200
+
+      - name: Package archive
+        run: |
+          cd backup
+          zip -q -r ../archie-backup.zip .
+          cd ..
+          sha256sum archie-backup.zip
+
+      - name: Upload archive to Dropbox
+        env:
+          DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
+          DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
+          DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
+        run: |
+          python backup_tool/dropbox_sync.py upload             --local archie-backup.zip             --remote /Archie/latest/archie-backup.zip
+          python backup_tool/dropbox_sync.py upload             --local backup/manifest.json             --remote /Archie/latest/manifest.json
+
+      - name: Upload GitHub workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: archie-latest
+          path: |
+            archie-backup.zip
+            backup/manifest.json
+          retention-days: 7
