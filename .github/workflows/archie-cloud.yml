@@ -11,7 +11,7 @@ permissions:
 jobs:
   archive:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     steps:
       - name: Checkout
@@ -25,23 +25,26 @@ jobs:
       - name: Install dependencies
         run: pip install -r backup_tool/requirements.txt
 
-      - name: Restore previous backup from Dropbox
+      - name: Restore previous archive
         env:
           DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
           DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
           DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
-        run: python backup_tool/dropbox_sync.py download --remote /Archie/latest/archie-backup.zip --output /tmp/archie-backup.zip || true
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
+        run: |
+          python backup_tool/cloud_sync.py download             --output /tmp/archie-backup.zip             --dropbox /Archie/latest/archie-backup.zip             --google-folder "$GOOGLE_DRIVE_FOLDER_ID"             --google-name archie-backup.zip
 
-      - name: Unpack previous backup
+      - name: Unpack previous archive
         run: |
           if [ -f /tmp/archie-backup.zip ]; then
             mkdir -p backup
             unzip -q -o /tmp/archie-backup.zip -d backup
           fi
 
-      - name: Download publicly accessible chapters
+      - name: Archive all currently discoverable chapters
         run: |
-          python backup_tool/backup.py             --start 1             --end 10000             --output backup             --delay 1             --max-pages 200
+          python backup_tool/backup.py             --start 1             --end 10000             --output backup             --delay 1             --max-pages 300
 
       - name: Package archive
         run: |
@@ -50,16 +53,19 @@ jobs:
           cd ..
           sha256sum archie-backup.zip
 
-      - name: Upload archive to Dropbox
+      - name: Upload to Dropbox and Google Drive
         env:
           DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
           DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
           DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
         run: |
-          python backup_tool/dropbox_sync.py upload             --local archie-backup.zip             --remote /Archie/latest/archie-backup.zip
-          python backup_tool/dropbox_sync.py upload             --local backup/manifest.json             --remote /Archie/latest/manifest.json
+          python backup_tool/cloud_sync.py upload             --local archie-backup.zip             --name archie-backup.zip             --dropbox /Archie/latest/archie-backup.zip             --google-folder "$GOOGLE_DRIVE_FOLDER_ID"
 
-      - name: Upload GitHub workflow artifact
+          python backup_tool/cloud_sync.py upload             --local backup/manifest.json             --name manifest.json             --dropbox /Archie/latest/manifest.json             --google-folder "$GOOGLE_DRIVE_FOLDER_ID"
+
+      - name: Keep a short-lived GitHub copy
         uses: actions/upload-artifact@v4
         with:
           name: archie-latest
