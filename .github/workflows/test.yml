@@ -13,6 +13,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -r backup_tool/requirements.txt
-      - run: python -m py_compile backup_tool/backup.py
-      - run: python backup_tool/backup.py --help
+      - run: pip install -r backup_tool/local/requirements.txt
+      - run: python -m py_compile backup_tool/local/backup.py
+      - run: python backup_tool/local/backup.py --help
