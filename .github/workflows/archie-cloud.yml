@@ -23,7 +23,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install -r backup_tool/requirements.txt
+        run: pip install -r backup_tool/cloud/requirements.txt
 
       - name: Restore previous archive
         env:
@@ -31,7 +31,7 @@ jobs:
           DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
           DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
         run: |
-          python backup_tool/cloud_sync.py download             --output /tmp/archie-backup.zip             --dropbox /Archie/latest/archie-backup.zip
+          python backup_tool/cloud/cloud_sync.py download             --output /tmp/archie-backup.zip             --dropbox /Archie/latest/archie-backup.zip
       - name: Unpack previous archive
         run: |
           if [ -f /tmp/archie-backup.zip ]; then
@@ -41,7 +41,7 @@ jobs:
 
       - name: Archive all currently discoverable chapters
         run: |
-          python backup_tool/backup.py             --start 1             --end 10000             --output backup             --delay 1             --max-pages 300
+          python backup_tool/cloud/backup.py             --start 1             --end 10000             --output backup             --delay 1             --max-pages 300
 
       - name: Package archive
         run: |
@@ -56,8 +56,8 @@ jobs:
           DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
           DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
         run: |
-          python backup_tool/cloud_sync.py upload             --local archie-backup.zip             --name archie-backup.zip             --dropbox /Archie/latest/archie-backup.zip
-          python backup_tool/cloud_sync.py upload             --local backup/manifest.json             --name manifest.json             --dropbox /Archie/latest/manifest.json
+          python backup_tool/cloud/cloud_sync.py upload             --local archie-backup.zip             --name archie-backup.zip             --dropbox /Archie/latest/archie-backup.zip
+          python backup_tool/cloud/cloud_sync.py upload             --local backup/manifest.json             --name manifest.json             --dropbox /Archie/latest/manifest.json
       - name: Keep a short-lived GitHub copy
         uses: actions/upload-artifact@v4
         with:
