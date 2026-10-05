@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import queue
 import re
 import subprocess
@@ -12,6 +13,9 @@ from tkinter import messagebox, ttk
 
 APP_DIR = Path(__file__).resolve().parent
 SCRIPT = APP_DIR / "browser_backup.py"
+BACKUP_DIR = APP_DIR / "backup"
+LOG_FILE = BACKUP_DIR / "archie.log"
+MANIFEST_FILE = BACKUP_DIR / "manifest.json"
 DEFAULT_START = 1590
 DEFAULT_END = 2362
 
@@ -20,8 +24,8 @@ class ArchieGui(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Archie · iFreedom Backup")
-        self.geometry("1000x720")
-        self.minsize(860, 600)
+        self.geometry("1000x760")
+        self.minsize(860, 620)
 
         self.process: subprocess.Popen[str] | None = None
         self.output_queue: queue.Queue[tuple[str, str]] = queue.Queue()
@@ -105,7 +109,9 @@ class ArchieGui(tk.Tk):
         )
         self.stop_button.pack(side="left", padx=8)
 
-        ttk.Button(actions, text="Открыть архив", command=self._open_backup).pack(side="right")
+        ttk.Button(actions, text="Открыть backup", command=self._open_backup).pack(side="right", padx=(8, 0))
+        ttk.Button(actions, text="Открыть manifest", command=self._open_manifest).pack(side="right", padx=(8, 0))
+        ttk.Button(actions, text="Открыть лог", command=self._open_log).pack(side="right")
 
         progress = ttk.LabelFrame(root, text="Прогресс", style="Card.TLabelframe")
         progress.pack(fill="x", pady=(0, 10))
@@ -121,22 +127,20 @@ class ArchieGui(tk.Tk):
             mode="determinate",
         ).pack(fill="x", pady=(9, 0))
 
-        hint = ttk.LabelFrame(root, text="Что нужно сделать", style="Card.TLabelframe")
+        hint = ttk.LabelFrame(root, text="Авторизация", style="Card.TLabelframe")
         hint.pack(fill="x", pady=(0, 10))
         ttk.Label(
             hint,
             text=(
-                "1) Archie откроет твой обычный Chrome. "
-                "2) В Chrome откройте chrome://inspect/#remote-debugging и включи "
-                "«Allow remote debugging for this browser instance». "
-                "3) Войди в iFreedom через VK. "
-                "4) Нажми «Я вошёл в iFreedom». "
-                "Archie использует именно этот профиль Chrome, без отдельной копии."
+                "Archie запускает обычный Chrome и не создаёт отдельный профиль. "
+                "Войди в iFreedom через VK вручную. "
+                "После нажатия «Я вошёл в iFreedom» Archie подключится к этой сессии. "
+                "При любой критической ошибке полный traceback записывается в backup\\archie.log."
             ),
             wraplength=920,
         ).pack(anchor="w")
 
-        log_frame = ttk.LabelFrame(root, text="Журнал", style="Card.TLabelframe")
+        log_frame = ttk.LabelFrame(root, text="Журнал текущего запуска", style="Card.TLabelframe")
         log_frame.pack(fill="both", expand=True)
         wrap = ttk.Frame(log_frame)
         wrap.pack(fill="both", expand=True)
@@ -160,7 +164,7 @@ class ArchieGui(tk.Tk):
 
         ttk.Label(
             root,
-            text="Archie не обходит CAPTCHA, платный доступ или другие ограничения доступа.",
+            text="Файлы диагностики: backup\\archie.log и backup\\browser.log. Ошибки также записываются в manifest.json.",
         ).pack(anchor="w", pady=(8, 0))
 
     def _write_log(self, message: str) -> None:
@@ -218,8 +222,8 @@ class ArchieGui(tk.Tk):
         self.status_var.set("Открываю обычный Chrome...")
         self._write_log("")
         self._write_log(f"=== Archie: главы {start}–{end} ===")
-        self._write_log("Открываю Google Chrome с твоим обычным профилем.")
-        self._write_log("В Chrome нужно включить Remote Debugging и войти в iFreedom.")
+        self._write_log(f"Лог: {LOG_FILE}")
+        self._write_log(f"Manifest: {MANIFEST_FILE}")
 
         cmd = [
             sys.executable,
@@ -276,7 +280,7 @@ class ArchieGui(tk.Tk):
             self.process.stdin.flush()
             self.login_button.configure(state="disabled")
             self.status_var.set("Подключаюсь к обычному Chrome...")
-            self._write_log('✓ Проверяю Chrome Remote Debugging и подключаюсь.')
+            self._write_log('✓ Сигнал "Я вошёл в iFreedom" отправлен.')
         except (BrokenPipeError, OSError) as exc:
             self._write_log(f"[ERR] Не удалось продолжить: {exc}")
 
@@ -321,30 +325,50 @@ class ArchieGui(tk.Tk):
         self.start_button.configure(state="normal")
         self.stop_button.configure(state="disabled")
         self.login_button.configure(state="disabled")
+
         if code == 0:
             self.progress_var.set(100)
             self.status_var.set("Готово")
             messagebox.showinfo("Archie", "Скачивание завершено без ошибок.")
         elif code == 2:
-            self.status_var.set("Нужна авторизация / Remote Debugging")
-            messagebox.showwarning(
-                "Archie",
-                "Chrome не подключился. Проверь Remote Debugging и авторизацию iFreedom.",
+            self.status_var.set("Критическая ошибка")
+            self._write_log(f"КРИТИЧЕСКАЯ ОШИБКА. Подробности: {LOG_FILE}")
+            messagebox.showerror(
+                "Archie: критическая ошибка",
+                f"Подробный лог:\n{LOG_FILE}\n\n"
+                f"Manifest:\n{MANIFEST_FILE}",
             )
         else:
             self.status_var.set("Завершено с ошибками")
+            self._write_log(f"Есть ошибки. Подробности: {LOG_FILE}")
             messagebox.showwarning(
                 "Archie",
-                "Загрузка завершилась с ошибками. Проверь журнал и manifest.json.",
+                f"Загрузка завершилась с ошибками.\n\n"
+                f"Подробный лог:\n{LOG_FILE}\n\n"
+                f"Manifest:\n{MANIFEST_FILE}",
             )
 
-    def _open_backup(self) -> None:
-        backup_dir = APP_DIR / "backup"
-        backup_dir.mkdir(exist_ok=True)
+    def _open_path(self, path: Path) -> None:
+        if not path.exists():
+            messagebox.showwarning("Archie", f"Файл ещё не создан:\n{path}")
+            return
         try:
-            subprocess.Popen(["explorer", str(backup_dir)])
+            os.startfile(path)
         except OSError as exc:
             messagebox.showerror("Ошибка", str(exc))
+
+    def _open_backup(self) -> None:
+        BACKUP_DIR.mkdir(exist_ok=True)
+        try:
+            os.startfile(BACKUP_DIR)
+        except OSError as exc:
+            messagebox.showerror("Ошибка", str(exc))
+
+    def _open_log(self) -> None:
+        self._open_path(LOG_FILE)
+
+    def _open_manifest(self) -> None:
+        self._open_path(MANIFEST_FILE)
 
     def _on_close(self) -> None:
         if self.process is not None:
