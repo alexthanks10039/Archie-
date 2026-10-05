@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import time
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -46,6 +47,41 @@ CHROME_CANDIDATES = (
 )
 
 
+def now_text() -> str:
+    return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S%z")
+
+
+class RunLogger:
+    def __init__(self, path: Path):
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.file = self.path.open("a", encoding="utf-8", buffering=1)
+
+    def log(self, message: str, level: str = "INFO") -> None:
+        line = f"[{now_text()}] [{level}] {message}"
+        print(line, flush=True)
+        try:
+            self.file.write(line + "\n")
+            self.file.flush()
+        except OSError:
+            pass
+
+    def exception(self, message: str, exc: BaseException) -> None:
+        self.log(f"{message}: {type(exc).__name__}: {exc}", "ERROR")
+        trace = traceback.format_exc()
+        try:
+            self.file.write(trace.rstrip() + "\n")
+            self.file.flush()
+        except OSError:
+            pass
+
+    def close(self) -> None:
+        try:
+            self.file.close()
+        except OSError:
+            pass
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Download iFreedom chapters through the user's normal Chrome profile."
@@ -74,7 +110,7 @@ def find_chrome() -> Path:
     if found:
         return Path(found).resolve()
     raise FileNotFoundError(
-        "Не найден Google Chrome. Установи Chrome или укажи путь к chrome.exe."
+        "Не найден Google Chrome. Установи Chrome или проверь стандартный путь установки."
     )
 
 
@@ -91,16 +127,32 @@ def devtools_active_port_file() -> Path:
     return default_chrome_user_data() / "DevToolsActivePort"
 
 
-def launch_normal_chrome(chrome: Path, book_url: str) -> None:
-    # Deliberately do NOT use --user-data-dir or any isolated profile.
-    # Chrome opens using the user's ordinary profile and existing cookies.
+def launch_normal_chrome(chrome: Path, book_url: str, browser_log_path: Path, logger: RunLogger) -> subprocess.Popen:
     inspect_url = "chrome://inspect/#remote-debugging"
-    subprocess.Popen(
-        [str(chrome), normalize_url(book_url, book_url), inspect_url],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
-    )
+    try:
+        browser_log = browser_log_path.open("a", encoding="utf-8", buffering=1)
+    except OSError as exc:
+        logger.exception("Не удалось открыть browser.log", exc)
+        browser_log = subprocess.DEVNULL
+
+    logger.log(f"Запускаю Chrome: {chrome}")
+    logger.log(f"Chrome user-data-dir: {default_chrome_user_data()}")
+    logger.log("Изолированный --user-data-dir НЕ используется.")
+
+    try:
+        process = subprocess.Popen(
+            [str(chrome), normalize_url(book_url, book_url), inspect_url],
+            stdout=browser_log,
+            stderr=subprocess.STDOUT,
+            creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+        )
+    except Exception:
+        if browser_log not in (subprocess.DEVNULL, None):
+            browser_log.close()
+        raise
+
+    logger.log(f"Chrome process PID: {process.pid}")
+    return process
 
 
 def read_cdp_endpoint() -> str | None:
@@ -118,27 +170,24 @@ def read_cdp_endpoint() -> str | None:
     return f"ws://127.0.0.1:{port}{ws_path}"
 
 
-def wait_for_cdp(wait_seconds: int) -> str:
+def wait_for_cdp(wait_seconds: int, logger: RunLogger) -> str:
     deadline = time.monotonic() + wait_seconds
+    last_port_file = devtools_active_port_file()
+    logger.log(f"Жду Chrome CDP до {wait_seconds} сек.")
+    logger.log(f"Проверяю файл: {last_port_file}")
+
     while time.monotonic() < deadline:
         endpoint = read_cdp_endpoint()
         if endpoint:
+            logger.log("Chrome CDP endpoint найден.")
             return endpoint
         time.sleep(0.5)
+
     raise TimeoutError(
-        "Chrome не предоставил CDP endpoint. Открой chrome://inspect/#remote-debugging "
-        "и включи «Allow remote debugging for this browser instance»."
+        "Chrome не предоставил CDP endpoint. "
+        "Открой chrome://inspect/#remote-debugging и включи "
+        "«Allow remote debugging for this browser instance»."
     )
-
-
-def attach_to_chrome(playwright):
-    endpoint = wait_for_cdp(180)
-    browser = playwright.chromium.connect_over_cdp(endpoint, timeout=30_000)
-    if not browser.contexts:
-        raise RuntimeError("Chrome подключился, но активная browser context не найдена.")
-    context = browser.contexts[0]
-    page = context.pages[0] if context.pages else context.new_page()
-    return browser, context, page
 
 
 def contains_auth_warning(text: str) -> bool:
@@ -151,14 +200,16 @@ def looks_suspicious(text: str) -> bool:
     return len(normalized) < 300 or contains_auth_warning(normalized)
 
 
-def fetch_with_browser(page, url: str, *, timeout_ms: int, retries: int, delay: float):
+def fetch_with_browser(page, url: str, *, timeout_ms: int, retries: int, delay: float, logger: RunLogger):
     last_error: Exception | None = None
     for attempt in range(1, retries + 1):
         try:
+            logger.log(f"Открываю URL, попытка {attempt}/{retries}: {url}")
             response = page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
             page.wait_for_timeout(1200)
             if response is None:
-                raise RuntimeError("браузер не вернул ответ")
+                raise RuntimeError("браузер не вернул HTTP response")
+            logger.log(f"HTTP {response.status}; фактический URL: {page.url}")
             if response.status >= 400:
                 raise RuntimeError(f"HTTP {response.status}")
             if delay:
@@ -166,6 +217,11 @@ def fetch_with_browser(page, url: str, *, timeout_ms: int, retries: int, delay: 
             return response
         except (PlaywrightTimeoutError, RuntimeError) as exc:
             last_error = exc
+            logger.log(
+                f"Ошибка открытия страницы, попытка {attempt}/{retries}: "
+                f"{type(exc).__name__}: {exc}",
+                "WARN",
+            )
             if attempt < retries:
                 time.sleep(min(2.0 * attempt, 5.0))
     assert last_error is not None
@@ -181,6 +237,7 @@ def save_browser_chapter(
     timeout_ms: int,
     retries: int,
     delay: float,
+    logger: RunLogger,
 ) -> dict:
     response = fetch_with_browser(
         page,
@@ -188,14 +245,18 @@ def save_browser_chapter(
         timeout_ms=timeout_ms,
         retries=retries,
         delay=delay,
+        logger=logger,
     )
     html = page.content()
+
     if contains_auth_warning(html):
         raise PermissionError(
             "iFreedom сообщает, что пользователь не авторизован. Глава не сохранена."
         )
 
     title, text = extract_text(html)
+    logger.log(f"Глава {number}: извлечено {len(text)} символов; title={title!r}")
+
     if looks_suspicious(text):
         raise ValueError(
             f"текст выглядит неполным ({len(text)} символов). Глава не сохранена."
@@ -218,86 +279,161 @@ def save_browser_chapter(
     }
 
 
+def save_fatal_manifest(
+    manifest_path: Path,
+    manifest: dict,
+    *,
+    stage: str,
+    exc: BaseException,
+) -> None:
+    manifest.setdefault("errors", [])
+    manifest["fatal_error"] = {
+        "stage": stage,
+        "type": type(exc).__name__,
+        "message": str(exc),
+        "traceback": traceback.format_exc(),
+        "at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        save_manifest(manifest_path, manifest)
+    except Exception:
+        pass
+
+
 def main() -> int:
     args = parse_args()
-    if args.start < 1 or args.end < args.start:
-        print("--start must be <= --end", file=sys.stderr)
-        return 2
-
     args.output.mkdir(parents=True, exist_ok=True)
-    chapter_dir = args.output / "chapters"
-    chapter_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = args.output / "manifest.json"
+    log_path = args.output / "archie.log"
+    browser_log_path = args.output / "browser.log"
+
+    logger = RunLogger(log_path)
     manifest = load_manifest(manifest_path)
     manifest.setdefault("chapters", {})
     manifest.setdefault("missing", [])
     manifest.setdefault("errors", [])
+    manifest["last_run"] = {
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "python": sys.version.split()[0],
+        "cwd": str(Path.cwd()),
+        "output": str(args.output.resolve()),
+        "start": args.start,
+        "end": args.end,
+    }
+    save_manifest(manifest_path, manifest)
 
-    print(f"Источник: {args.book_url}")
-    print(f"Диапазон: {args.start}-{args.end}")
-    print("Собираю ссылки...")
-
-    from requests import Session
-
-    session = Session()
-    session.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/129.0 Safari/537.36"
-        ),
-        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-    })
-
-    links = collect_chapter_links(
-        session,
-        args.book_url,
-        args.start,
-        args.end,
-        timeout=args.timeout,
-        retries=args.retries,
-        delay=args.delay,
-        max_pages=100,
-    )
-    print(f"Найдено ссылок: {len(links)}")
-
-    missing = []
-    pending = []
-    for number in range(args.start, args.end + 1):
-        url = links.get(number)
-        if not url:
-            missing.append(number)
-            print(f"[MISS] {number}: ссылка на главу не найдена")
-        else:
-            pending.append((number, url))
-
-    chrome = find_chrome()
-    print()
-    print("Открываю обычный Google Chrome без отдельного профиля.")
-    print("В Chrome откроются книга iFreedom и настройка Remote Debugging.")
-    print("Включи «Allow remote debugging for this browser instance».")
-    print("Затем войди в iFreedom через VK и проверь полный текст главы.")
-    print("После этого вернись в Archie и нажми Enter.")
-    launch_normal_chrome(chrome, args.book_url)
-
+    browser_process = None
+    browser_log_file = None
     browser = None
+
     try:
+        if args.start < 1 or args.end < args.start:
+            raise ValueError("--start must be <= --end")
+
+        chapter_dir = args.output / "chapters"
+        chapter_dir.mkdir(parents=True, exist_ok=True)
+
+        logger.log("=" * 70)
+        logger.log(f"Archie run: chapters {args.start}-{args.end}")
+        logger.log(f"Python: {sys.version.replace(chr(10), ' ')}")
+        logger.log(f"CWD: {Path.cwd()}")
+        logger.log(f"Output: {args.output.resolve()}")
+        logger.log(f"Manifest: {manifest_path.resolve()}")
+        logger.log(f"Log: {log_path.resolve()}")
+        logger.log(f"Browser log: {browser_log_path.resolve()}")
+
+        logger.log("Собираю ссылки публичным HTTP-клиентом.")
+        from requests import Session
+
+        session = Session()
+        session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/129.0 Safari/537.36"
+            ),
+            "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+        })
+
+        try:
+            links = collect_chapter_links(
+                session,
+                args.book_url,
+                args.start,
+                args.end,
+                timeout=args.timeout,
+                retries=args.retries,
+                delay=args.delay,
+                max_pages=100,
+            )
+        except Exception as exc:
+            logger.exception("Не удалось собрать ссылки на главы", exc)
+            raise
+
+        logger.log(f"Найдено ссылок: {len(links)}")
+
+        missing = []
+        pending = []
+        for number in range(args.start, args.end + 1):
+            url = links.get(number)
+            if not url:
+                missing.append(number)
+                logger.log(f"[MISS] {number}: ссылка не найдена", "WARN")
+            else:
+                pending.append((number, url))
+
+        manifest["missing"] = sorted(set(missing))
+        manifest["range"] = {"start": args.start, "end": args.end}
+        manifest["source"] = args.book_url
+        save_manifest(manifest_path, manifest)
+
+        chrome = find_chrome()
+        logger.log(f"Chrome найден: {chrome}")
+        browser_process = launch_normal_chrome(
+            chrome,
+            args.book_url,
+            browser_log_path,
+            logger,
+        )
+
+        logger.log("Теперь войди в iFreedom через VK в обычном Chrome.")
+        logger.log("После входа нажми кнопку «Я вошёл в iFreedom» в GUI.")
+
         input("Готово с авторизацией? Нажми Enter... ")
+
         with sync_playwright() as p:
-            endpoint = wait_for_cdp(args.wait_browser)
-            print(f"Chrome CDP найден: {endpoint.split('/devtools/')[0]}")
+            endpoint = wait_for_cdp(args.wait_browser, logger)
+            logger.log("Подключаюсь к Chrome через CDP.")
             browser = p.chromium.connect_over_cdp(endpoint, timeout=30_000)
+            logger.log(f"Chrome contexts: {len(browser.contexts)}")
+
             if not browser.contexts:
-                raise RuntimeError("Не найдена активная Chrome session.")
+                raise RuntimeError("Не найдена активная Chrome browser context.")
+
             context = browser.contexts[0]
             pages = context.pages
+            logger.log(f"Открытых вкладок: {len(pages)}")
             page = pages[0] if pages else context.new_page()
+
+            try:
+                body_text = page.locator("body").inner_text(timeout=args.timeout * 1000)
+                if contains_auth_warning(body_text):
+                    raise PermissionError(
+                        "В открытой Chrome-сессии iFreedom всё ещё показывает "
+                        "сообщение об отсутствии авторизации."
+                    )
+            except PlaywrightTimeoutError as exc:
+                logger.log(
+                    "Не удалось прочитать body открытой вкладки для проверки авторизации.",
+                    "WARN",
+                )
+                logger.exception("Playwright timeout during auth check", exc)
 
             errors = []
             for index, (number, url) in enumerate(pending, start=1):
                 target = chapter_dir / f"{number}.txt"
                 try:
-                    print(f"[GET ] {number} ({index}/{len(pending)}) {url}")
+                    logger.log(f"[GET] {number} ({index}/{len(pending)}): {url}")
                     record = save_browser_chapter(
                         page,
                         number,
@@ -306,10 +442,13 @@ def main() -> int:
                         timeout_ms=args.timeout * 1000,
                         retries=args.retries,
                         delay=args.delay,
+                        logger=logger,
                     )
                     manifest["chapters"][str(number)] = record
                     save_manifest(manifest_path, manifest)
-                    print(f"[OK  ] {number}: {record['chars']} chars")
+                    logger.log(
+                        f"[OK] {number}: {record['chars']} chars, {record['bytes']} bytes"
+                    )
                 except (
                     PlaywrightTimeoutError,
                     PermissionError,
@@ -319,15 +458,25 @@ def main() -> int:
                 ) as exc:
                     if target.exists():
                         target.unlink()
-                    errors.append({"number": number, "url": url, "error": str(exc)})
-                    print(f"[ERR ] {number}: {exc}", file=sys.stderr)
+                    error_record = {
+                        "number": number,
+                        "url": url,
+                        "type": type(exc).__name__,
+                        "error": str(exc),
+                        "traceback": traceback.format_exc(),
+                        "at": datetime.now(timezone.utc).isoformat(),
+                    }
+                    errors.append(error_record)
+                    manifest["errors"] = errors
+                    save_manifest(manifest_path, manifest)
+                    logger.exception(f"[ERR] Глава {number}", exc)
 
             manifest["missing"] = sorted(set(missing))
             manifest["errors"] = errors
             manifest["range"] = {"start": args.start, "end": args.end}
             manifest["source"] = args.book_url
             manifest["mode"] = "existing_chrome_profile_cdp"
-            manifest["updated_at"] = datetime.now(timezone.utc).isoformat()
+            manifest["last_run"]["finished_at"] = datetime.now(timezone.utc).isoformat()
             save_manifest(manifest_path, manifest)
 
             build_combined_backup(
@@ -342,17 +491,37 @@ def main() -> int:
                 for number in range(args.start, args.end + 1)
                 if (chapter_dir / f"{number}.txt").exists()
             )
-            print()
-            print(f"Готово. Сохранено файлов: {saved}")
-            print(f"Нет ссылок: {len(manifest['missing'])}")
-            print(f"Ошибок: {len(manifest['errors'])}")
-            return 0 if not errors and not missing else 1
+
+            logger.log(f"Готово. Сохранено файлов: {saved}")
+            logger.log(f"Нет ссылок: {len(manifest['missing'])}")
+            logger.log(f"Ошибок: {len(manifest['errors'])}")
+
+            if errors or missing:
+                return 1
+            return 0
+
+    except Exception as exc:
+        stage = "startup_or_runtime"
+        logger.exception(f"Критическая ошибка: {stage}", exc)
+        save_fatal_manifest(manifest_path, manifest, stage=stage, exc=exc)
+        try:
+            manifest["last_run"]["finished_at"] = datetime.now(timezone.utc).isoformat()
+            save_manifest(manifest_path, manifest)
+        except Exception:
+            pass
+        return 2
+
     finally:
         if browser is not None:
             try:
                 browser.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.exception("Ошибка при закрытии Playwright browser connection", exc)
+        if browser_process is not None:
+            logger.log(f"Chrome PID {browser_process.pid} завершает работу: {browser_process.poll()}")
+            # Do not kill the user's normal Chrome session.
+        logger.log(f"Логи сохранены: {log_path.resolve()}")
+        logger.close()
 
 
 if __name__ == "__main__":
