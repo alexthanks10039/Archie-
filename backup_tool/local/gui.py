@@ -151,8 +151,7 @@ class ArchieGui(tk.Tk):
 
     def _write_log(self, message: str) -> None:
         self.log.configure(state="normal")
-        self.log.insert("end", message.rstrip() + "
-")
+        self.log.insert("end", message.rstrip() + "\n")
         self.log.see("end")
         self.log.configure(state="disabled")
 
@@ -283,7 +282,7 @@ class ArchieGui(tk.Tk):
             self.process.stdin.flush()
             self.login_button.configure(state="disabled")
             self.status_var.set("Скачиваю главы...")
-            self._write_log("✓ Сигнал "Я вошёл" отправлен.")
+            self._write_log('✓ Сигнал "Я вошёл" отправлен.')
         except (BrokenPipeError, OSError) as exc:
             self._write_log(f"[ERR] Не удалось продолжить: {exc}")
 
