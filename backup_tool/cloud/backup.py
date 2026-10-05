@@ -265,6 +265,15 @@ def extract_text(html: str) -> tuple[str, str]:
     return title, "\n\n".join(cleaned).strip()
 
 
+def group_chapter_links(links: dict[int, str]) -> dict[str, list[int]]:
+    grouped: dict[str, list[int]] = {}
+    for number, url in links.items():
+        grouped.setdefault(url, []).append(number)
+    for numbers in grouped.values():
+        numbers.sort()
+    return dict(sorted(grouped.items(), key=lambda item: item[1][0]))
+
+
 def extract_content_blocks(html: str) -> tuple[str, list[tuple[str, str]]]:
     soup = BeautifulSoup(html, "lxml")
     for tag in soup(["script", "style", "noscript", "iframe", "svg", "form", "button", "nav", "header", "footer", "aside"]):
