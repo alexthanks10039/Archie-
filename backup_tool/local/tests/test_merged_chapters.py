@@ -38,6 +38,24 @@ class TestMergedChapterParsing(unittest.TestCase):
         self.assertNotEqual(numbers, [1855])
         self.assertEqual(numbers, [1854, 1855])
 
+    def test_real_range_numbers_1849_to_1856(self) -> None:
+        soup = BeautifulSoup(
+            """
+            <div>
+              <a href="/x/glava-1850/">Глава 1849-1850</a>
+              <a href="/x/glava-1851/">Глава 1851</a>
+              <a href="/x/glava-1852/">Глава 1852-1853</a>
+              <a href="/x/glava-1855/">Глава 1854-1855</a>
+              <a href="/x/glava-1856/">Глава 1856</a>
+            </div>
+            """,
+            "lxml",
+        )
+        discovered = []
+        for anchor in soup.find_all("a"):
+            discovered.extend(chapter_numbers_from_anchor(anchor))
+        self.assertEqual(sorted(discovered), list(range(1849, 1857)))
+
     def test_grouping_fetches_merged_source_once(self) -> None:
         links = {
             1854: "https://ifreedom.su/x/glava-1855/",
@@ -56,9 +74,11 @@ class TestMergedChapterParsing(unittest.TestCase):
         html = """
         <article>
           <h2>Глава 1854-Мастер города Чистилища 5</h2>
-          <p>First chapter body with enough text.</p>
+          <p>First chapter body with enough text to pass the parser validation and demonstrate the first independent chapter segment correctly.</p>
+          <p>More first chapter material makes the separation test realistic enough for the minimum length guard.</p>
           <h2>Глава 1855-Мастер города Чистилища 6</h2>
-          <p>Second chapter body with enough text.</p>
+          <p>Second chapter body with enough text to pass the parser validation and demonstrate the second independent chapter segment correctly.</p>
+          <p>More second chapter material makes the separation test realistic enough for the minimum length guard.</p>
         </article>
         """
         result = split_merged_chapters(html, [1854, 1855])
