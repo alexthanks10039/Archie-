@@ -308,7 +308,7 @@ class ArchieGui(tk.Tk):
         self.after(100, self._drain_output)
 
     def _update_progress_from_line(self, line: str) -> None:
-        if re.search(r"\[(OK\s*|ERR|MISS)", line):
+        if re.search(r"\[(OK\s*|ERR|MISS|MERGED\]\s*chapter)", line):
             self.done_count += 1
             self.counter_label.configure(text=f"{self.done_count} / {self.total_count}")
             if self.total_count:
