@@ -68,12 +68,37 @@ def chapter_number_from_text(text: str) -> int | None:
     return None
 
 
-def chapter_number_from_anchor(anchor) -> int | None:
+def chapter_numbers_from_anchor(anchor) -> list[int]:
+    """
+    Return every chapter number explicitly represented by the anchor label.
+
+    iFreedom sometimes publishes a single page under a title such as
+    "Глава 1854-1855", while the URL itself contains only "glava-1855".
+    The old parser returned only 1855 and therefore falsely reported 1854
+    as missing. Prefer the visible range in the anchor text, then fall back
+    to the URL.
+    """
     href = anchor.get("href", "")
-    number = chapter_number_from_text(href)
+    text = anchor.get_text(" ", strip=True)
+
+    range_match = re.search(
+        r"(?:глава|chapter)\s*№?\s*(\d+)\s*[-–—]\s*(\d+)",
+        text,
+        re.I,
+    )
+    if range_match:
+        first = int(range_match.group(1))
+        second = int(range_match.group(2))
+        if first <= second:
+            return list(range(first, second + 1))
+        return list(range(second, first + 1))
+
+    number = chapter_number_from_text(text)
     if number is not None:
-        return number
-    return chapter_number_from_text(anchor.get_text(" ", strip=True))
+        return [number]
+
+    number = chapter_number_from_text(href)
+    return [number] if number is not None else []
 
 
 def likely_chapter_anchor(anchor) -> bool:
@@ -146,9 +171,9 @@ def collect_chapter_links(
                 continue
 
             if likely_chapter_anchor(anchor):
-                number = chapter_number_from_anchor(anchor)
-                if number is not None and start <= number <= end:
-                    chapters.setdefault(number, href)
+                for number in chapter_numbers_from_anchor(anchor):
+                    if start <= number <= end:
+                        chapters.setdefault(number, href)
                 continue
 
             if looks_like_pagination(anchor):
