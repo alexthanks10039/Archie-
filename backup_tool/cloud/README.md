@@ -41,3 +41,12 @@ Workflow находится в .github/workflows/archie-cloud.yml.
 Google Drive в этой версии отсутствует.
 
 Инструмент работает только с обычными публично доступными страницами и не обходит авторизацию, платный доступ, CAPTCHA, DRM или другие технические ограничения.
+
+
+## Авторизация iFreedom
+
+Облачный загрузчик использует тот же алгоритм, что локальный CLI. Для GitHub Actions добавь Repository Secret:
+
+    IFREEDOM_COOKIE_HEADER
+
+Workflow передаст его в backup.py автоматически.
