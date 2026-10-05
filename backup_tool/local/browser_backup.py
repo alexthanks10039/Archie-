@@ -4,11 +4,9 @@ import argparse
 import json
 import os
 import shutil
-import socket
 import subprocess
 import sys
 import time
-import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -41,28 +39,16 @@ AUTH_WARNINGS = (
     "для чтения войдите",
 )
 
-BROWSER_CANDIDATES = {
-    "yandex": (
-        Path(os.environ.get("LOCALAPPDATA", "")) / "Yandex/YandexBrowser/Application/browser.exe",
-        Path(os.environ.get("PROGRAMFILES", "")) / "Yandex/YandexBrowser/Application/browser.exe",
-        Path(os.environ.get("PROGRAMFILES(X86)", "")) / "Yandex/YandexBrowser/Application/browser.exe",
-    ),
-    "chrome": (
-        Path(os.environ.get("LOCALAPPDATA", "")) / "Google/Chrome/Application/chrome.exe",
-        Path(os.environ.get("PROGRAMFILES", "")) / "Google/Chrome/Application/chrome.exe",
-        Path(os.environ.get("PROGRAMFILES(X86)", "")) / "Google/Chrome/Application/chrome.exe",
-    ),
-    "edge": (
-        Path(os.environ.get("PROGRAMFILES(X86)", "")) / "Microsoft/Edge/Application/msedge.exe",
-        Path(os.environ.get("PROGRAMFILES", "")) / "Microsoft/Edge/Application/msedge.exe",
-        Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft/Edge/Application/msedge.exe",
-    ),
-}
+CHROME_CANDIDATES = (
+    Path(os.environ.get("LOCALAPPDATA", "")) / "Google/Chrome/Application/chrome.exe",
+    Path(os.environ.get("PROGRAMFILES", "")) / "Google/Chrome/Application/chrome.exe",
+    Path(os.environ.get("PROGRAMFILES(X86)", "")) / "Google/Chrome/Application/chrome.exe",
+)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Download iFreedom chapters through a user-authenticated Chromium browser."
+        description="Download iFreedom chapters through the user's normal Chrome profile."
     )
     parser.add_argument("--start", type=int, default=DEFAULT_START)
     parser.add_argument("--end", type=int, default=DEFAULT_END)
@@ -71,16 +57,88 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--retries", type=int, default=DEFAULT_RETRIES)
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
     parser.add_argument("--book-url", default=BOOK_URL)
-    parser.add_argument("--browser", choices=("yandex", "chrome", "edge"), default="yandex")
-    parser.add_argument("--browser-path", type=Path, default=None)
-    parser.add_argument("--debug-port", type=int, default=0)
     parser.add_argument(
-        "--profile",
-        type=Path,
-        default=Path(".browser-profile"),
-        help="Dedicated browser profile. It stores the login session locally.",
+        "--wait-browser",
+        type=int,
+        default=180,
+        help="Seconds to wait for Chrome remote debugging after the user enables it.",
     )
     return parser.parse_args()
+
+
+def find_chrome() -> Path:
+    for candidate in CHROME_CANDIDATES:
+        if candidate.is_file():
+            return candidate.resolve()
+    found = shutil.which("chrome.exe")
+    if found:
+        return Path(found).resolve()
+    raise FileNotFoundError(
+        "Не найден Google Chrome. Установи Chrome или укажи путь к chrome.exe."
+    )
+
+
+def default_chrome_user_data() -> Path:
+    return (
+        Path(os.environ.get("LOCALAPPDATA", ""))
+        / "Google"
+        / "Chrome"
+        / "User Data"
+    ).resolve()
+
+
+def devtools_active_port_file() -> Path:
+    return default_chrome_user_data() / "DevToolsActivePort"
+
+
+def launch_normal_chrome(chrome: Path, book_url: str) -> None:
+    # Deliberately do NOT use --user-data-dir or any isolated profile.
+    # Chrome opens using the user's ordinary profile and existing cookies.
+    inspect_url = "chrome://inspect/#remote-debugging"
+    subprocess.Popen(
+        [str(chrome), normalize_url(book_url, book_url), inspect_url],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+    )
+
+
+def read_cdp_endpoint() -> str | None:
+    path = devtools_active_port_file()
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return None
+    if len(lines) < 2:
+        return None
+    port = lines[0].strip()
+    ws_path = lines[1].strip()
+    if not port.isdigit() or not ws_path.startswith("/devtools/browser/"):
+        return None
+    return f"ws://127.0.0.1:{port}{ws_path}"
+
+
+def wait_for_cdp(wait_seconds: int) -> str:
+    deadline = time.monotonic() + wait_seconds
+    while time.monotonic() < deadline:
+        endpoint = read_cdp_endpoint()
+        if endpoint:
+            return endpoint
+        time.sleep(0.5)
+    raise TimeoutError(
+        "Chrome не предоставил CDP endpoint. Открой chrome://inspect/#remote-debugging "
+        "и включи «Allow remote debugging for this browser instance»."
+    )
+
+
+def attach_to_chrome(playwright):
+    endpoint = wait_for_cdp(180)
+    browser = playwright.chromium.connect_over_cdp(endpoint, timeout=30_000)
+    if not browser.contexts:
+        raise RuntimeError("Chrome подключился, но активная browser context не найдена.")
+    context = browser.contexts[0]
+    page = context.pages[0] if context.pages else context.new_page()
+    return browser, context, page
 
 
 def contains_auth_warning(text: str) -> bool:
@@ -91,98 +149,6 @@ def contains_auth_warning(text: str) -> bool:
 def looks_suspicious(text: str) -> bool:
     normalized = " ".join(text.split()).strip()
     return len(normalized) < 300 or contains_auth_warning(normalized)
-
-
-def find_browser(browser: str, explicit: Path | None) -> Path:
-    if explicit:
-        path = explicit.expanduser().resolve()
-        if not path.is_file():
-            raise FileNotFoundError(f"Браузер не найден: {path}")
-        return path
-
-    for candidate in BROWSER_CANDIDATES[browser]:
-        if candidate and candidate.is_file():
-            return candidate.resolve()
-
-    aliases = {
-        "yandex": ("browser.exe",),
-        "chrome": ("chrome.exe",),
-        "edge": ("msedge.exe",),
-    }
-    for name in aliases[browser]:
-        resolved = shutil.which(name)
-        if resolved:
-            return Path(resolved).resolve()
-
-    raise FileNotFoundError(
-        f"Не найден {browser}. Укажи путь к browser.exe через --browser-path."
-    )
-
-
-def find_free_port(start: int = 9222) -> int:
-    for port in range(start, start + 100):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            try:
-                sock.bind(("127.0.0.1", port))
-            except OSError:
-                continue
-        return port
-    raise RuntimeError("Не удалось найти свободный порт для браузера.")
-
-
-def wait_for_cdp(port: int, timeout: int) -> None:
-    deadline = time.monotonic() + timeout
-    endpoint = f"http://127.0.0.1:{port}/json/version"
-    last_error: Exception | None = None
-    while time.monotonic() < deadline:
-        try:
-            with urllib.request.urlopen(endpoint, timeout=1.5) as response:
-                if response.status == 200:
-                    return
-        except Exception as exc:
-            last_error = exc
-        time.sleep(0.25)
-    raise RuntimeError(
-        f"Не дождался запуска браузера на порту {port}: {last_error}"
-    )
-
-
-def launch_real_browser(
-    executable: Path,
-    profile: Path,
-    port: int,
-    url: str,
-) -> subprocess.Popen:
-    profile.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        str(executable),
-        f"--remote-debugging-port={port}",
-        f"--user-data-dir={profile}",
-        "--no-first-run",
-        "--no-default-browser-check",
-        url,
-    ]
-    return subprocess.Popen(
-        cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
-    )
-
-
-def attach_to_browser(playwright, port: int):
-    browser = playwright.chromium.connect_over_cdp(
-        f"http://127.0.0.1:{port}",
-        timeout=30_000,
-        is_local=True,
-        no_defaults=True,
-    )
-    contexts = browser.contexts
-    if not contexts:
-        raise RuntimeError("Браузер запущен, но Playwright не увидел контекст.")
-    context = contexts[0]
-    page = context.pages[0] if context.pages else context.new_page()
-    return browser, context, page
 
 
 def fetch_with_browser(page, url: str, *, timeout_ms: int, retries: int, delay: float):
@@ -226,8 +192,7 @@ def save_browser_chapter(
     html = page.content()
     if contains_auth_warning(html):
         raise PermissionError(
-            "iFreedom сообщает, что пользователь не авторизован. "
-            "Глава не сохранена."
+            "iFreedom сообщает, что пользователь не авторизован. Глава не сохранена."
         )
 
     title, text = extract_text(html)
@@ -306,33 +271,27 @@ def main() -> int:
         else:
             pending.append((number, url))
 
-    executable = find_browser(args.browser, args.browser_path)
-    port = args.debug_port or find_free_port()
-    profile = args.profile.resolve()
-
+    chrome = find_chrome()
     print()
-    print(f"Браузер: {executable}")
-    print(f"Профиль: {profile}")
-    print(f"CDP порт: {port}")
-    print()
-    print("Запускаю обычный видимый браузер.")
-    print("Войди в iFreedom через VK вручную.")
-    print("После входа открой книгу и проверь, что глава читается полностью.")
-    print("Затем нажми Enter в Archie.")
-
-    browser_process = launch_real_browser(
-        executable,
-        profile,
-        port,
-        normalize_url(args.book_url, args.book_url),
-    )
+    print("Открываю обычный Google Chrome без отдельного профиля.")
+    print("В Chrome откроются книга iFreedom и настройка Remote Debugging.")
+    print("Включи «Allow remote debugging for this browser instance».")
+    print("Затем войди в iFreedom через VK и проверь полный текст главы.")
+    print("После этого вернись в Archie и нажми Enter.")
+    launch_normal_chrome(chrome, args.book_url)
 
     browser = None
     try:
-        wait_for_cdp(port, args.timeout)
+        input("Готово с авторизацией? Нажми Enter... ")
         with sync_playwright() as p:
-            browser, context, page = attach_to_browser(p, port)
-            input("После успешного входа и проверки доступа нажми Enter... ")
+            endpoint = wait_for_cdp(args.wait_browser)
+            print(f"Chrome CDP найден: {endpoint.split('/devtools/')[0]}")
+            browser = p.chromium.connect_over_cdp(endpoint, timeout=30_000)
+            if not browser.contexts:
+                raise RuntimeError("Не найдена активная Chrome session.")
+            context = browser.contexts[0]
+            pages = context.pages
+            page = pages[0] if pages else context.new_page()
 
             errors = []
             for index, (number, url) in enumerate(pending, start=1):
@@ -367,7 +326,7 @@ def main() -> int:
             manifest["errors"] = errors
             manifest["range"] = {"start": args.start, "end": args.end}
             manifest["source"] = args.book_url
-            manifest["mode"] = f"real_{args.browser}_browser_cdp"
+            manifest["mode"] = "existing_chrome_profile_cdp"
             manifest["updated_at"] = datetime.now(timezone.utc).isoformat()
             save_manifest(manifest_path, manifest)
 
@@ -389,15 +348,11 @@ def main() -> int:
             print(f"Ошибок: {len(manifest['errors'])}")
             return 0 if not errors and not missing else 1
     finally:
-        try:
-            if browser is not None:
+        if browser is not None:
+            try:
                 browser.close()
-        except Exception:
-            pass
-        try:
-            browser_process.terminate()
-        except Exception:
-            pass
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
