@@ -4,3 +4,4 @@ __pycache__/
 backup/
 .env
 .DS_Store
+.browser-profile/
