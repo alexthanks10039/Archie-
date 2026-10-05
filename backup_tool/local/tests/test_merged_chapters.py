@@ -10,6 +10,7 @@ from backup import (
     chapter_numbers_from_anchor,
     group_chapter_links,
     split_merged_chapters,
+    extract_text,
     save_merged_chapters,
 )
 
@@ -69,6 +70,22 @@ class TestMergedChapterParsing(unittest.TestCase):
                 "https://ifreedom.su/x/glava-1856/": [1856],
             },
         )
+
+    def test_extract_visible_text_when_content_is_div_based(self) -> None:
+        html = """
+        <html><body>
+          <div class="reader-content">
+            <div>Это первый абзац главы, который хранится не в p.</div>
+            <div>Это второй абзац главы и он тоже находится внутри div.</div>
+            <div>Дополнительный текст главы нужен для проверки fallback извлечения.</div>
+          </div>
+        </body></html>
+        """
+        title, text = extract_text(html)
+        self.assertEqual(title, "")
+        self.assertIn("Это первый абзац главы", text)
+        self.assertIn("Это второй абзац главы", text)
+        self.assertGreater(len(text), 80)
 
     def test_heading_with_title_suffix_is_detected(self) -> None:
         html = """
