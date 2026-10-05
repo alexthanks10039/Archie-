@@ -228,20 +228,55 @@ def extract_text(html: str) -> tuple[str, str]:
 
     root = None
     for selector in (
-        "article", ".entry-content", ".post-content", ".entry",
-        ".td-post-content", ".single-post-content", "main",
+        "article",
+        ".entry-content",
+        ".post-content",
+        ".chapter-content",
+        ".reader-content",
+        "#reader-content",
+        ".text-content",
+        "#content",
+        ".epcontent",
+        ".container.main-container",
+        ".entry",
+        ".td-post-content",
+        ".single-post-content",
+        "main",
     ):
-        root = soup.select_one(selector)
-        if root:
-            break
+        candidate = soup.select_one(selector)
+        if candidate:
+            text_len = len(re.sub(r"\s+", " ", candidate.get_text(" ", strip=True)))
+            if text_len >= 100:
+                root = candidate
+                break
 
     if root is None:
-        root = soup.body or soup
+        # Last-resort compatibility fallback for layout changes on iFreedom:
+        # choose the largest readable content container, excluding obvious chrome.
+        best = None
+        best_len = 0
+        for candidate in soup.find_all(["article", "div", "section"]):
+            classes = " ".join(candidate.get("class") or []).lower()
+            ident = str(candidate.get("id") or "").lower()
+            if any(word in classes or word in ident for word in (
+                "header", "footer", "sidebar", "comment", "navigation",
+                "menu", "widget", "advert", "banner",
+            )):
+                continue
+            text_len = len(re.sub(r"\s+", " ", candidate.get_text(" ", strip=True)))
+            if text_len > best_len:
+                best = candidate
+                best_len = text_len
+        root = best if best is not None and best_len >= 500 else (soup.body or soup)
 
     for selector in (
-        ".sidebar", ".widget", ".comments", ".related-posts",
-        ".post-navigation", ".share-buttons", ".navigation",
-        ".breadcrumbs", ".breadcrumb",
+        ".sidebar", ".widget", ".comments", ".comments-area", ".wpdiscuz",
+        ".related-posts", ".post-navigation", ".share-buttons", ".social-share",
+        ".navigation", ".nav-links", ".chapter-nav", ".breadcrumbs", ".breadcrumb",
+        ".ads", ".banner", ".yandex", "noindex", ".code-block", ".sharedaddy",
+        ".select-chapter", ".single-select", ".fontsize-ctrl", ".font-size-controls",
+        ".mistape_caption", "#mistape_dialog", ".report-error", ".settings-panel",
+        ".controls", ".func-btn", ".entry-header",
     ):
         for tag in root.select(selector):
             tag.decompose()
@@ -299,6 +334,14 @@ def extract_content_blocks(html: str) -> tuple[str, list[tuple[str, str]]]:
     for tag, block in blocks:
         if not cleaned or cleaned[-1][1] != block:
             cleaned.append((tag, block))
+
+    if len("\n\n".join(block for _, block in cleaned).strip()) < MIN_CHAPTER_TEXT:
+        fallback = root.get_text("\n", strip=True)
+        fallback = re.sub(r"\n{3,}", "\n\n", fallback)
+        fallback = fallback.strip()
+        if len(fallback) >= MIN_CHAPTER_TEXT:
+            cleaned = [("text", fallback)]
+
     return title, cleaned
 
 
@@ -433,6 +476,7 @@ def save_chapter(
         "final_url": response.url,
         "status": response.status_code,
         "title": title,
+        "chars": len(text),
         "bytes": output.stat().st_size,
         "sha256": sha256(output),
         "saved_at": datetime.now(timezone.utc).isoformat(),
