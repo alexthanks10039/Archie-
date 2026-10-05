@@ -52,15 +52,27 @@ class TestMergedChapterParsing(unittest.TestCase):
             },
         )
 
+    def test_heading_with_title_suffix_is_detected(self) -> None:
+        html = """
+        <article>
+          <h2>Глава 1854-Мастер города Чистилища 5</h2>
+          <p>First chapter body with enough text.</p>
+          <h2>Глава 1855-Мастер города Чистилища 6</h2>
+          <p>Second chapter body with enough text.</p>
+        </article>
+        """
+        result = split_merged_chapters(html, [1854, 1855])
+        self.assertEqual(set(result), {1854, 1855})
+
     def test_split_merged_html(self) -> None:
         html = """
         <html><body>
         <article class="entry-content">
           <h1>Глава 1854-1855: Мастер города Чистилища</h1>
-          <h2>Глава 1854</h2>
+          <h2>Глава 1854-Мастер города Чистилища 5</h2>
           <p>Текст первой главы. Разные события происходят здесь.</p>
           <p>Ещё один абзац первой главы.</p>
-          <h2>Глава 1855</h2>
+          <h2>Глава 1855-Мастер города Чистилища 6</h2>
           <p>Текст второй главы. Это уже совершенно другой фрагмент.</p>
           <p>Ещё один абзац второй главы.</p>
         </article>
