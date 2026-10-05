@@ -334,6 +334,14 @@ def extract_content_blocks(html: str) -> tuple[str, list[tuple[str, str]]]:
     for tag, block in blocks:
         if not cleaned or cleaned[-1][1] != block:
             cleaned.append((tag, block))
+
+    if len("\n\n".join(block for _, block in cleaned).strip()) < MIN_CHAPTER_TEXT:
+        fallback = root.get_text("\n", strip=True)
+        fallback = re.sub(r"\n{3,}", "\n\n", fallback)
+        fallback = fallback.strip()
+        if len(fallback) >= MIN_CHAPTER_TEXT:
+            cleaned = [("text", fallback)]
+
     return title, cleaned
 
 
@@ -468,6 +476,7 @@ def save_chapter(
         "final_url": response.url,
         "status": response.status_code,
         "title": title,
+        "chars": len(text),
         "bytes": output.stat().st_size,
         "sha256": sha256(output),
         "saved_at": datetime.now(timezone.utc).isoformat(),
