@@ -20,8 +20,8 @@ class ArchieGui(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Archie · iFreedom Backup")
-        self.geometry("980x700")
-        self.minsize(820, 580)
+        self.geometry("1000x720")
+        self.minsize(860, 600)
 
         self.process: subprocess.Popen[str] | None = None
         self.output_queue: queue.Queue[tuple[str, str]] = queue.Queue()
@@ -32,6 +32,7 @@ class ArchieGui(tk.Tk):
         self.end_var = tk.StringVar(value=str(DEFAULT_END))
         self.delay_var = tk.StringVar(value="1")
         self.timeout_var = tk.StringVar(value="25")
+        self.browser_var = tk.StringVar(value="yandex")
         self.status_var = tk.StringVar(value="Готово")
         self.progress_var = tk.DoubleVar(value=0)
 
@@ -60,7 +61,7 @@ class ArchieGui(tk.Tk):
         ttk.Label(header, text="Archie", style="Title.TLabel").pack(anchor="w")
         ttk.Label(
             header,
-            text="Резервное скачивание глав iFreedom через авторизованный браузер",
+            text="Скачивание глав iFreedom через обычный авторизованный браузер",
             style="Subtitle.TLabel",
         ).pack(anchor="w", pady=(3, 0))
 
@@ -70,13 +71,24 @@ class ArchieGui(tk.Tk):
         row1 = ttk.Frame(settings)
         row1.pack(fill="x")
         ttk.Label(row1, text="С главы").pack(side="left")
-        ttk.Entry(row1, textvariable=self.start_var, width=10).pack(side="left", padx=(8, 24))
+        ttk.Entry(row1, textvariable=self.start_var, width=10).pack(side="left", padx=(8, 22))
         ttk.Label(row1, text="По главу").pack(side="left")
-        ttk.Entry(row1, textvariable=self.end_var, width=10).pack(side="left", padx=(8, 24))
+        ttk.Entry(row1, textvariable=self.end_var, width=10).pack(side="left", padx=(8, 22))
+
+        ttk.Label(row1, text="Браузер").pack(side="left")
+        browser_box = ttk.Combobox(
+            row1,
+            textvariable=self.browser_var,
+            values=("yandex", "chrome", "edge"),
+            state="readonly",
+            width=10,
+        )
+        browser_box.pack(side="left", padx=(8, 22))
+
         ttk.Label(row1, text="Задержка, сек").pack(side="left")
-        ttk.Entry(row1, textvariable=self.delay_var, width=8).pack(side="left", padx=(8, 24))
+        ttk.Entry(row1, textvariable=self.delay_var, width=7).pack(side="left", padx=(8, 22))
         ttk.Label(row1, text="Таймаут, сек").pack(side="left")
-        ttk.Entry(row1, textvariable=self.timeout_var, width=8).pack(side="left", padx=(8, 0))
+        ttk.Entry(row1, textvariable=self.timeout_var, width=7).pack(side="left", padx=(8, 0))
 
         row2 = ttk.Frame(settings)
         row2.pack(fill="x", pady=(12, 0))
@@ -90,21 +102,30 @@ class ArchieGui(tk.Tk):
         actions.pack(fill="x", pady=(0, 10))
 
         self.start_button = ttk.Button(
-            actions, text="▶ Запустить скачивание", style="Accent.TButton", command=self.start_download
+            actions,
+            text="▶ Запустить скачивание",
+            style="Accent.TButton",
+            command=self.start_download,
         )
         self.start_button.pack(side="left", padx=(0, 8))
 
         self.login_button = ttk.Button(
-            actions, text="✓ Я вошёл в iFreedom", command=self.confirm_login, state="disabled"
+            actions,
+            text="✓ Я вошёл в iFreedom",
+            command=self.confirm_login,
+            state="disabled",
         )
         self.login_button.pack(side="left", padx=8)
 
         self.stop_button = ttk.Button(
-            actions, text="■ Остановить", command=self.stop_download, state="disabled"
+            actions,
+            text="■ Остановить",
+            command=self.stop_download,
+            state="disabled",
         )
         self.stop_button.pack(side="left", padx=8)
 
-        ttk.Button(actions, text="Тест 1 главы", command=self.test_one).pack(side="right")
+        ttk.Button(actions, text="Тест текущей главы", command=self.test_one).pack(side="right")
 
         progress_frame = ttk.LabelFrame(root, text="3. Прогресс", style="Card.TLabelframe")
         progress_frame.pack(fill="x", pady=(0, 10))
@@ -119,6 +140,18 @@ class ArchieGui(tk.Tk):
             maximum=100,
             mode="determinate",
         ).pack(fill="x", pady=(9, 0))
+
+        hint = ttk.LabelFrame(root, text="Как это работает", style="Card.TLabelframe")
+        hint.pack(fill="x", pady=(0, 10))
+        ttk.Label(
+            hint,
+            text=(
+                "Archie запускает настоящий Яндекс Браузер с отдельным профилем. "
+                "Вход через VK делаешь ты сам. После входа нажми «Я вошёл в iFreedom», "
+                "и Archie подключится к этой сессии."
+            ),
+            wraplength=900,
+        ).pack(anchor="w")
 
         log_frame = ttk.LabelFrame(root, text="Журнал", style="Card.TLabelframe")
         log_frame.pack(fill="both", expand=True)
@@ -146,7 +179,7 @@ class ArchieGui(tk.Tk):
         footer.pack(fill="x", pady=(10, 0))
         ttk.Label(
             footer,
-            text="Вход выполняется вручную в открывшемся Chromium. Archie не обходит CAPTCHA или ограничения доступа.",
+            text="Вход выполняется вручную. Archie не обходит CAPTCHA, paywall или другие ограничения.",
         ).pack(side="left")
 
     def _write_log(self, message: str) -> None:
@@ -155,35 +188,17 @@ class ArchieGui(tk.Tk):
         self.log.see("end")
         self.log.configure(state="disabled")
 
-    def _set_inputs_state(self, enabled: bool) -> None:
-        state = "normal" if enabled else "disabled"
-        for widget in self.winfo_children():
-            self._set_children_state(widget, state)
-
-    def _set_children_state(self, parent: tk.Misc, state: str) -> None:
-        for child in parent.winfo_children():
-            if child in {self.start_button, self.login_button, self.stop_button}:
-                continue
-            try:
-                if isinstance(child, (ttk.Entry, ttk.Button)):
-                    child.configure(state=state)
-            except tk.TclError:
-                pass
-            self._set_children_state(child, state)
-
     def _parse_int(self, var: tk.StringVar, label: str) -> int:
         try:
-            value = int(var.get().strip())
+            return int(var.get().strip())
         except ValueError as exc:
             raise ValueError(f"{label}: укажи целое число") from exc
-        return value
 
     def _parse_float(self, var: tk.StringVar, label: str) -> float:
         try:
-            value = float(var.get().strip().replace(",", "."))
+            return float(var.get().strip().replace(",", "."))
         except ValueError as exc:
             raise ValueError(f"{label}: укажи число") from exc
-        return value
 
     def _validate(self) -> tuple[int, int, float, int]:
         start = self._parse_int(self.start_var, "С главы")
@@ -199,8 +214,7 @@ class ArchieGui(tk.Tk):
         return start, end, delay, timeout
 
     def test_one(self) -> None:
-        self.start_var.set(self.start_var.get().strip() or str(DEFAULT_START))
-        self.end_var.set(self.start_var.get())
+        self.end_var.set(self.start_var.get().strip())
         self.start_download()
 
     def start_download(self) -> None:
@@ -223,9 +237,10 @@ class ArchieGui(tk.Tk):
         self.done_count = 0
         self.progress_var.set(0)
         self.counter_label.configure(text=f"0 / {self.total_count}")
-        self.status_var.set("Запускаю...")
+        self.status_var.set("Запускаю браузер...")
         self._write_log("")
         self._write_log(f"=== Archie: главы {start}–{end} ===")
+        self._write_log(f"Браузер: {self.browser_var.get()}")
 
         cmd = [
             sys.executable,
@@ -239,6 +254,8 @@ class ArchieGui(tk.Tk):
             str(delay),
             "--timeout",
             str(timeout),
+            "--browser",
+            self.browser_var.get(),
         ]
 
         try:
@@ -262,7 +279,6 @@ class ArchieGui(tk.Tk):
         self.start_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
         self.login_button.configure(state="normal")
-        self.status_var.set("Открылся браузер. Войди в iFreedom.")
         threading.Thread(target=self._read_process_output, daemon=True).start()
 
     def _read_process_output(self) -> None:
@@ -281,7 +297,7 @@ class ArchieGui(tk.Tk):
             self.process.stdin.write("\n")
             self.process.stdin.flush()
             self.login_button.configure(state="disabled")
-            self.status_var.set("Скачиваю главы...")
+            self.status_var.set("Подключаюсь к авторизованному браузеру...")
             self._write_log('✓ Сигнал "Я вошёл" отправлен.')
         except (BrokenPipeError, OSError) as exc:
             self._write_log(f"[ERR] Не удалось продолжить: {exc}")
@@ -328,19 +344,20 @@ class ArchieGui(tk.Tk):
         self.stop_button.configure(state="disabled")
         self.login_button.configure(state="disabled")
         if code == 0:
+            self.progress_var.set(100)
             self.status_var.set("Готово")
             messagebox.showinfo("Archie", "Скачивание завершено без ошибок.")
         elif code == 2:
             self.status_var.set("Остановлено / нужна авторизация")
             messagebox.showwarning(
                 "Archie",
-                "Загрузка не продолжилась. Проверь вход в iFreedom и повтори запуск.",
+                "Загрузка не продолжилась. Проверь браузер и вход в iFreedom.",
             )
         else:
             self.status_var.set("Завершено с ошибками")
             messagebox.showwarning(
                 "Archie",
-                "Загрузка завершилась с ошибками. Открой manifest.json и журнал.",
+                "Загрузка завершилась с ошибками. Открой журнал и manifest.json.",
             )
 
     def _open_backup(self) -> None:
@@ -353,7 +370,7 @@ class ArchieGui(tk.Tk):
 
     def _on_close(self) -> None:
         if self.process is not None:
-            if not messagebox.askyesno("Archie", "Остановить текущее скачивание и закрыть программу?"):
+            if not messagebox.askyesno("Archie", "Остановить скачивание и закрыть программу?"):
                 return
             try:
                 self.process.terminate()
@@ -363,5 +380,4 @@ class ArchieGui(tk.Tk):
 
 
 if __name__ == "__main__":
-    app = ArchieGui()
-    app.mainloop()
+    ArchieGui().mainloop()
