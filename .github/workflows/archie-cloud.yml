@@ -40,6 +40,8 @@ jobs:
           fi
 
       - name: Archive all currently discoverable chapters
+        env:
+          IFREEDOM_COOKIE_HEADER: ${{ secrets.IFREEDOM_COOKIE_HEADER }}
         run: |
           python backup_tool/cloud/backup.py             --start 1             --end 10000             --output backup             --delay 1             --max-pages 300
 
