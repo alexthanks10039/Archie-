@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
+import socket
+import subprocess
 import sys
 import time
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -28,7 +33,6 @@ from backup import (
 
 AUTH_WARNINGS = (
     "пользователь не авторизован",
-    "пользователь не авторизован.",
     "необходимо авторизоваться",
     "необходимо войти",
     "войдите в аккаунт",
@@ -37,13 +41,28 @@ AUTH_WARNINGS = (
     "для чтения войдите",
 )
 
+BROWSER_CANDIDATES = {
+    "yandex": (
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Yandex/YandexBrowser/Application/browser.exe",
+        Path(os.environ.get("PROGRAMFILES", "")) / "Yandex/YandexBrowser/Application/browser.exe",
+        Path(os.environ.get("PROGRAMFILES(X86)", "")) / "Yandex/YandexBrowser/Application/browser.exe",
+    ),
+    "chrome": (
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Google/Chrome/Application/chrome.exe",
+        Path(os.environ.get("PROGRAMFILES", "")) / "Google/Chrome/Application/chrome.exe",
+        Path(os.environ.get("PROGRAMFILES(X86)", "")) / "Google/Chrome/Application/chrome.exe",
+    ),
+    "edge": (
+        Path(os.environ.get("PROGRAMFILES(X86)", "")) / "Microsoft/Edge/Application/msedge.exe",
+        Path(os.environ.get("PROGRAMFILES", "")) / "Microsoft/Edge/Application/msedge.exe",
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft/Edge/Application/msedge.exe",
+    ),
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=(
-            "Download iFreedom chapters through a real browser session. "
-            "Use only for content your account is legitimately allowed to access."
-        )
+        description="Download iFreedom chapters through a user-authenticated Chromium browser."
     )
     parser.add_argument("--start", type=int, default=DEFAULT_START)
     parser.add_argument("--end", type=int, default=DEFAULT_END)
@@ -52,11 +71,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--retries", type=int, default=DEFAULT_RETRIES)
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
     parser.add_argument("--book-url", default=BOOK_URL)
+    parser.add_argument("--browser", choices=("yandex", "chrome", "edge"), default="yandex")
+    parser.add_argument("--browser-path", type=Path, default=None)
+    parser.add_argument("--debug-port", type=int, default=0)
     parser.add_argument(
         "--profile",
         type=Path,
         default=Path(".browser-profile"),
-        help="Persistent Chromium profile. Cookies/session stay here and are gitignored.",
+        help="Dedicated browser profile. It stores the login session locally.",
     )
     return parser.parse_args()
 
@@ -68,26 +90,111 @@ def contains_auth_warning(text: str) -> bool:
 
 def looks_suspicious(text: str) -> bool:
     normalized = " ".join(text.split()).strip()
-    if len(normalized) < 300:
-        return True
-    return contains_auth_warning(normalized)
+    return len(normalized) < 300 or contains_auth_warning(normalized)
+
+
+def find_browser(browser: str, explicit: Path | None) -> Path:
+    if explicit:
+        path = explicit.expanduser().resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"Браузер не найден: {path}")
+        return path
+
+    for candidate in BROWSER_CANDIDATES[browser]:
+        if candidate and candidate.is_file():
+            return candidate.resolve()
+
+    aliases = {
+        "yandex": ("browser.exe",),
+        "chrome": ("chrome.exe",),
+        "edge": ("msedge.exe",),
+    }
+    for name in aliases[browser]:
+        resolved = shutil.which(name)
+        if resolved:
+            return Path(resolved).resolve()
+
+    raise FileNotFoundError(
+        f"Не найден {browser}. Укажи путь к browser.exe через --browser-path."
+    )
+
+
+def find_free_port(start: int = 9222) -> int:
+    for port in range(start, start + 100):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            try:
+                sock.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+        return port
+    raise RuntimeError("Не удалось найти свободный порт для браузера.")
+
+
+def wait_for_cdp(port: int, timeout: int) -> None:
+    deadline = time.monotonic() + timeout
+    endpoint = f"http://127.0.0.1:{port}/json/version"
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(endpoint, timeout=1.5) as response:
+                if response.status == 200:
+                    return
+        except Exception as exc:
+            last_error = exc
+        time.sleep(0.25)
+    raise RuntimeError(
+        f"Не дождался запуска браузера на порту {port}: {last_error}"
+    )
+
+
+def launch_real_browser(
+    executable: Path,
+    profile: Path,
+    port: int,
+    url: str,
+) -> subprocess.Popen:
+    profile.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        str(executable),
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={profile}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        url,
+    ]
+    return subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+    )
+
+
+def attach_to_browser(playwright, port: int):
+    browser = playwright.chromium.connect_over_cdp(
+        f"http://127.0.0.1:{port}",
+        timeout=30_000,
+        is_local=True,
+        no_defaults=True,
+    )
+    contexts = browser.contexts
+    if not contexts:
+        raise RuntimeError("Браузер запущен, но Playwright не увидел контекст.")
+    context = contexts[0]
+    page = context.pages[0] if context.pages else context.new_page()
+    return browser, context, page
 
 
 def fetch_with_browser(page, url: str, *, timeout_ms: int, retries: int, delay: float):
     last_error: Exception | None = None
     for attempt in range(1, retries + 1):
         try:
-            response = page.goto(
-                url,
-                wait_until="domcontentloaded",
-                timeout=timeout_ms,
-            )
-            page.wait_for_timeout(700)
+            response = page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            page.wait_for_timeout(1200)
             if response is None:
-                raise RuntimeError("browser navigation returned no response")
-            status = response.status
-            if status >= 400:
-                raise RuntimeError(f"HTTP {status}")
+                raise RuntimeError("браузер не вернул ответ")
+            if response.status >= 400:
+                raise RuntimeError(f"HTTP {response.status}")
             if delay:
                 time.sleep(delay)
             return response
@@ -119,15 +226,14 @@ def save_browser_chapter(
     html = page.content()
     if contains_auth_warning(html):
         raise PermissionError(
-            "iFreedom returned an authorization warning. "
-            "Log in with an account that has access to this chapter, then retry."
+            "iFreedom сообщает, что пользователь не авторизован. "
+            "Глава не сохранена."
         )
 
     title, text = extract_text(html)
     if looks_suspicious(text):
         raise ValueError(
-            f"extracted text looks incomplete ({len(text)} chars); "
-            "the chapter was not saved"
+            f"текст выглядит неполным ({len(text)} символов). Глава не сохранена."
         )
 
     output = chapter_dir / f"{number}.txt"
@@ -162,15 +268,10 @@ def main() -> int:
     manifest.setdefault("missing", [])
     manifest.setdefault("errors", [])
 
-    profile = args.profile.resolve()
-    profile.mkdir(parents=True, exist_ok=True)
-
     print(f"Источник: {args.book_url}")
     print(f"Диапазон: {args.start}-{args.end}")
     print("Собираю ссылки...")
 
-    # Link discovery stays public; the actual chapter requests are performed
-    # in the logged-in browser session.
     from requests import Session
 
     session = Session()
@@ -205,41 +306,33 @@ def main() -> int:
         else:
             pending.append((number, url))
 
-    print()
-    print("Откроется Chromium с отдельным профилем.")
-    print("1) Войди в iFreedom в открывшемся окне.")
-    print("2) Открой страницу книги и убедись, что главы доступны.")
-    print("3) Вернись в консоль и нажми Enter.")
-    print()
+    executable = find_browser(args.browser, args.browser_path)
+    port = args.debug_port or find_free_port()
+    profile = args.profile.resolve()
 
-    with sync_playwright() as p:
-        context = p.chromium.launch_persistent_context(
-            user_data_dir=str(profile),
-            headless=False,
-            viewport={"width": 1440, "height": 1000},
-            locale="ru-RU",
-        )
-        page = context.pages[0] if context.pages else context.new_page()
+    print()
+    print(f"Браузер: {executable}")
+    print(f"Профиль: {profile}")
+    print(f"CDP порт: {port}")
+    print()
+    print("Запускаю обычный видимый браузер.")
+    print("Войди в iFreedom через VK вручную.")
+    print("После входа открой книгу и проверь, что глава читается полностью.")
+    print("Затем нажми Enter в Archie.")
 
-        try:
-            page.goto(
-                normalize_url(args.book_url, args.book_url),
-                wait_until="domcontentloaded",
-                timeout=args.timeout * 1000,
-            )
-            page.wait_for_timeout(700)
-            print(f"Текущая страница: {page.url}")
+    browser_process = launch_real_browser(
+        executable,
+        profile,
+        port,
+        normalize_url(args.book_url, args.book_url),
+    )
+
+    browser = None
+    try:
+        wait_for_cdp(port, args.timeout)
+        with sync_playwright() as p:
+            browser, context, page = attach_to_browser(p, port)
             input("После успешного входа и проверки доступа нажми Enter... ")
-
-            # A visible browser gives the user a chance to finish login or
-            # handle a normal site prompt. No CAPTCHA/auth bypass is attempted.
-            book_text = page.locator("body").inner_text(timeout=args.timeout * 1000)
-            if contains_auth_warning(book_text):
-                print(
-                    "[WARN] Браузер всё ещё выглядит неавторизованным. "
-                    "Продолжение остановлено, чтобы не сохранить неполные главы."
-                )
-                return 2
 
             errors = []
             for index, (number, url) in enumerate(pending, start=1):
@@ -267,18 +360,14 @@ def main() -> int:
                 ) as exc:
                     if target.exists():
                         target.unlink()
-                    errors.append({
-                        "number": number,
-                        "url": url,
-                        "error": str(exc),
-                    })
+                    errors.append({"number": number, "url": url, "error": str(exc)})
                     print(f"[ERR ] {number}: {exc}", file=sys.stderr)
 
             manifest["missing"] = sorted(set(missing))
             manifest["errors"] = errors
             manifest["range"] = {"start": args.start, "end": args.end}
             manifest["source"] = args.book_url
-            manifest["mode"] = "authenticated_browser"
+            manifest["mode"] = f"real_{args.browser}_browser_cdp"
             manifest["updated_at"] = datetime.now(timezone.utc).isoformat()
             save_manifest(manifest_path, manifest)
 
@@ -299,8 +388,16 @@ def main() -> int:
             print(f"Нет ссылок: {len(manifest['missing'])}")
             print(f"Ошибок: {len(manifest['errors'])}")
             return 0 if not errors and not missing else 1
-        finally:
-            context.close()
+    finally:
+        try:
+            if browser is not None:
+                browser.close()
+        except Exception:
+            pass
+        try:
+            browser_process.terminate()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
