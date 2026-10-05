@@ -123,7 +123,10 @@ def main() -> int:
                 raise RuntimeError("Не найдена Chrome browser context.")
             context = browser.contexts[0]
             pages = context.pages
-            page = pages[0] if pages else context.new_page()
+            page = next(
+                (candidate for candidate in pages if "ifreedom.su" in candidate.url.lower()),
+                pages[0] if pages else context.new_page(),
+            )
 
             try:
                 body = page.locator("body").inner_text(timeout=args.timeout * 1000)
