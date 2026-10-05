@@ -211,7 +211,6 @@ def main() -> int:
     print("2) Открой страницу книги и убедись, что главы доступны.")
     print("3) Вернись в консоль и нажми Enter.")
     print()
-    input("После успешного входа нажми Enter... ")
 
     with sync_playwright() as p:
         context = p.chromium.launch_persistent_context(
@@ -230,6 +229,7 @@ def main() -> int:
             )
             page.wait_for_timeout(700)
             print(f"Текущая страница: {page.url}")
+            input("После успешного входа и проверки доступа нажми Enter... ")
 
             # A visible browser gives the user a chance to finish login or
             # handle a normal site prompt. No CAPTCHA/auth bypass is attempted.
@@ -237,10 +237,9 @@ def main() -> int:
             if contains_auth_warning(book_text):
                 print(
                     "[WARN] Браузер всё ещё выглядит неавторизованным. "
-                    "Продолжение может привести к неполным главам."
+                    "Продолжение остановлено, чтобы не сохранить неполные главы."
                 )
-                print("Войди в аккаунт в этом окне и проверь доступ к книге.")
-                input("После входа нажми Enter... ")
+                return 2
 
             errors = []
             for index, (number, url) in enumerate(pending, start=1):
