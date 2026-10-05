@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import argparse
@@ -23,11 +24,19 @@ DEFAULT_END = 2362
 DEFAULT_DELAY = 1.0
 DEFAULT_RETRIES = 3
 DEFAULT_TIMEOUT = 25
+MIN_CHAPTER_TEXT = 80
+MIN_MERGED_CHAPTER_TEXT = 80
 
 CHAPTER_PATTERNS = (
     re.compile(r"(?:/|-)glava[-_ ]?(\d+)(?:/|$)", re.I),
     re.compile(r"(?:/|-)chapter[-_ ]?(\d+)(?:/|$)", re.I),
     re.compile(r"(?:глава|chapter)[\s#№-]*(\d+)", re.I),
+)
+CHAPTER_HEADING_PATTERN = re.compile(
+    r"^(?:глава|chapter)\s*[#№]?\s*(\d+)"
+    r"(?:\s*[-–—]\s*(\d+))?"
+    r"(?:\s*[:.].*)?$",
+    re.I,
 )
 
 
@@ -41,7 +50,14 @@ def same_domain(url: str, source: str) -> bool:
     return urlparse(url).netloc.lower() == urlparse(source).netloc.lower()
 
 
-def fetch(session: requests.Session, url: str, *, timeout: int, retries: int, delay: float) -> requests.Response:
+def fetch(
+    session: requests.Session,
+    url: str,
+    *,
+    timeout: int,
+    retries: int,
+    delay: float,
+) -> requests.Response:
     last_error: Exception | None = None
     for attempt in range(1, retries + 1):
         try:
@@ -68,22 +84,14 @@ def chapter_number_from_text(text: str) -> int | None:
     return None
 
 
-def chapter_numbers_from_anchor(anchor) -> list[int]:
-    """
-    Return every chapter number explicitly represented by the anchor label.
-
-    iFreedom sometimes publishes a single page under a title such as
-    "Глава 1854-1855", while the URL itself contains only "glava-1855".
-    The old parser returned only 1855 and therefore falsely reported 1854
-    as missing. Prefer the visible range in the anchor text, then fall back
-    to the URL.
-    """
-    href = anchor.get("href", "")
-    text = anchor.get_text(" ", strip=True)
+def chapter_numbers_from_label(text: str) -> list[int]:
+    value = re.sub(r"\s+", " ", text or "").strip()
+    if not value:
+        return []
 
     range_match = re.search(
-        r"(?:глава|chapter)\s*№?\s*(\d+)\s*[-–—]\s*(\d+)",
-        text,
+        r"(?:глава|chapter)\s*[#№]?\s*(\d+)\s*[-–—]\s*(\d+)",
+        value,
         re.I,
     )
     if range_match:
@@ -93,11 +101,16 @@ def chapter_numbers_from_anchor(anchor) -> list[int]:
             return list(range(first, second + 1))
         return list(range(second, first + 1))
 
-    number = chapter_number_from_text(text)
-    if number is not None:
-        return [number]
+    number = chapter_number_from_text(value)
+    return [number] if number is not None else []
 
-    number = chapter_number_from_text(href)
+
+def chapter_numbers_from_anchor(anchor) -> list[int]:
+    """Return all chapter numbers explicitly represented by an anchor label."""
+    numbers = chapter_numbers_from_label(anchor.get_text(" ", strip=True))
+    if numbers:
+        return numbers
+    number = chapter_number_from_text(anchor.get("href", ""))
     return [number] if number is not None else []
 
 
@@ -136,22 +149,29 @@ def collect_chapter_links(
     delay: float,
     max_pages: int = 100,
 ) -> dict[int, str]:
+    """Return chapter_number -> source URL.
+
+    A merged source maps every represented chapter number to the same source
+    URL. Callers must group URLs before downloading.
+    """
     pending = [normalize_url(book_url, book_url)]
     seen_pages: set[str] = set()
     chapters: dict[int, str] = {}
     base_path = urlparse(book_url).path.rstrip("/")
 
     while pending and len(seen_pages) < max_pages:
-        page_url = pending.pop(0)
-        page_url = normalize_url(book_url, page_url)
+        page_url = normalize_url(book_url, pending.pop(0))
         if page_url in seen_pages:
             continue
         seen_pages.add(page_url)
 
         try:
             response = fetch(
-                session, page_url,
-                timeout=timeout, retries=retries, delay=delay,
+                session,
+                page_url,
+                timeout=timeout,
+                retries=retries,
+                delay=delay,
             )
         except requests.RequestException as exc:
             print(f"[WARN] index page failed: {page_url} :: {exc}")
@@ -192,16 +212,16 @@ def collect_chapter_links(
     return dict(sorted(chapters.items()))
 
 
-def extract_text(html: str) -> tuple[str, str]:
-    soup = BeautifulSoup(html, "lxml")
+def group_chapter_links(links: dict[int, str]) -> dict[str, list[int]]:
+    grouped: dict[str, list[int]] = {}
+    for number, url in links.items():
+        grouped.setdefault(url, []).append(number)
+    for numbers in grouped.values():
+        numbers.sort()
+    return dict(sorted(grouped.items(), key=lambda item: item[1][0]))
 
-    for tag in soup([
-        "script", "style", "noscript", "iframe", "svg", "form",
-        "button", "nav", "header", "footer", "aside",
-    ]):
-        tag.decompose()
 
-    root = None
+def find_content_root(soup: BeautifulSoup):
     for selector in (
         "article", ".entry-content", ".post-content", ".entry",
         ".td-post-content", ".single-post-content", "main",
@@ -209,8 +229,7 @@ def extract_text(html: str) -> tuple[str, str]:
         root = soup.select_one(selector)
         if root:
             break
-
-    if root is None:
+    else:
         root = soup.body or soup
 
     for selector in (
@@ -221,23 +240,148 @@ def extract_text(html: str) -> tuple[str, str]:
         for tag in root.select(selector):
             tag.decompose()
 
+    return root
+
+
+def clean_soup(html: str) -> tuple[BeautifulSoup, BeautifulSoup]:
+    soup = BeautifulSoup(html, "lxml")
+    for tag in soup([
+        "script", "style", "noscript", "iframe", "svg", "form",
+        "button", "nav", "header", "footer", "aside",
+    ]):
+        tag.decompose()
+    return soup, find_content_root(soup)
+
+
+def extract_content_blocks(html: str) -> tuple[str, list[tuple[str, str]]]:
+    soup, root = clean_soup(html)
+
     title = ""
     title_node = soup.find("h1") or soup.find("title")
     if title_node:
-        title = title_node.get_text(" ", strip=True)
+        title = re.sub(r"\s+", " ", title_node.get_text(" ", strip=True)).strip()
 
-    blocks: list[str] = []
-    for node in root.find_all(["h1", "h2", "h3", "h4", "p", "blockquote", "li"]):
+    blocks: list[tuple[str, str]] = []
+    for node in root.find_all(
+        ["h1", "h2", "h3", "h4", "h5", "h6", "p", "blockquote", "li"]
+    ):
         value = re.sub(r"\s+", " ", node.get_text(" ", strip=True)).strip()
         if value:
-            blocks.append(value)
+            blocks.append((node.name.lower(), value))
 
-    cleaned: list[str] = []
-    for block in blocks:
-        if not cleaned or cleaned[-1] != block:
-            cleaned.append(block)
+    cleaned: list[tuple[str, str]] = []
+    for tag, block in blocks:
+        if not cleaned or cleaned[-1][1] != block:
+            cleaned.append((tag, block))
+    return title, cleaned
 
-    return title, "\n\n".join(cleaned).strip()
+
+def extract_text(html: str) -> tuple[str, str]:
+    title, blocks = extract_content_blocks(html)
+    return title, "\n\n".join(block for _, block in blocks).strip()
+
+
+def detect_heading_numbers(text: str) -> list[int]:
+    normalized = re.sub(r"\s+", " ", text or "").strip()
+    match = CHAPTER_HEADING_PATTERN.match(normalized)
+    if not match:
+        return []
+
+    first = int(match.group(1))
+    second = match.group(2)
+    if second:
+        second_num = int(second)
+        return (
+            list(range(first, second_num + 1))
+            if first <= second_num
+            else list(range(second_num, first + 1))
+        )
+    return [first]
+
+
+def split_merged_chapters(
+    html: str,
+    expected_numbers: list[int],
+) -> dict[int, dict[str, str]]:
+    """Split a merged source page using explicit chapter headings.
+
+    The function is deliberately conservative. If every expected chapter does
+    not have an unambiguous heading in the content, it raises instead of
+    duplicating or guessing text.
+    """
+    expected = sorted(set(expected_numbers))
+    if len(expected) < 2:
+        raise ValueError("split_merged_chapters requires at least two chapters")
+
+    _, blocks = extract_content_blocks(html)
+    if not blocks:
+        raise ValueError("content root contains no readable blocks")
+
+    positions: dict[int, int] = {}
+    for index, (_, block) in enumerate(blocks):
+        numbers = detect_heading_numbers(block)
+        if not numbers:
+            continue
+
+        # A single heading covering the entire merged range is not enough to
+        # establish where the individual chapter texts begin and end.
+        if numbers == expected:
+            continue
+
+        for number in numbers:
+            if number in expected and number not in positions:
+                positions[number] = index
+
+    missing = [number for number in expected if number not in positions]
+    if missing:
+        raise ValueError(
+            "individual chapter headings not found for: "
+            + ", ".join(map(str, missing))
+        )
+
+    ordered = [(number, positions[number]) for number in expected]
+    if any(a[1] >= b[1] for a, b in zip(ordered, ordered[1:])):
+        raise ValueError("chapter headings are not in ascending document order")
+
+    result: dict[int, dict[str, str]] = {}
+    for idx, (number, heading_index) in enumerate(ordered):
+        end_index = ordered[idx + 1][1] if idx + 1 < len(ordered) else len(blocks)
+        body = "\n\n".join(
+            block for _, block in blocks[heading_index + 1:end_index]
+        ).strip()
+
+        if len(body) < MIN_MERGED_CHAPTER_TEXT:
+            raise ValueError(
+                f"chapter {number}: suspiciously short text ({len(body)} chars)"
+            )
+
+        result[number] = {
+            "title": blocks[heading_index][1],
+            "text": body,
+        }
+
+    normalized_texts: dict[int, str] = {}
+    for number, item in result.items():
+        normalized = re.sub(r"\s+", " ", item["text"]).strip()
+        duplicate_of = next(
+            (other for other, value in normalized_texts.items() if value == normalized),
+            None,
+        )
+        if duplicate_of is not None:
+            raise ValueError(
+                f"chapter {number} is identical to chapter {duplicate_of}; "
+                "refusing to save duplicate merged content"
+            )
+        normalized_texts[number] = normalized
+
+    return result
+
+
+def split_merged_page(
+    html: str,
+    expected_numbers: list[int],
+) -> dict[int, dict[str, str]]:
+    return split_merged_chapters(html, expected_numbers)
 
 
 def sha256(path: Path) -> str:
@@ -264,6 +408,19 @@ def save_manifest(path: Path, manifest: dict) -> None:
     )
 
 
+def write_chapter_file(
+    chapter_dir: Path,
+    number: int,
+    title: str,
+    text: str,
+) -> Path:
+    if not text or len(text.strip()) < MIN_CHAPTER_TEXT:
+        raise ValueError(f"chapter {number}: extracted text is too short")
+    output = chapter_dir / f"{number}.txt"
+    output.write_text(f"{title}\n\n{text}\n", encoding="utf-8")
+    return output
+
+
 def save_chapter(
     session: requests.Session,
     number: int,
@@ -275,16 +432,14 @@ def save_chapter(
     delay: float,
 ) -> dict:
     response = fetch(
-        session, url,
-        timeout=timeout, retries=retries, delay=delay,
+        session,
+        url,
+        timeout=timeout,
+        retries=retries,
+        delay=delay,
     )
     title, text = extract_text(response.text)
-
-    if len(text) < 80:
-        raise ValueError("page parsed, but extracted text is suspiciously short")
-
-    output = chapter_dir / f"{number}.txt"
-    output.write_text(f"{title}\n\n{text}\n", encoding="utf-8")
+    output = write_chapter_file(chapter_dir, number, title, text)
 
     return {
         "number": number,
@@ -293,13 +448,54 @@ def save_chapter(
         "status": response.status_code,
         "title": title,
         "bytes": output.stat().st_size,
+        "chars": len(text),
         "sha256": sha256(output),
         "saved_at": datetime.now(timezone.utc).isoformat(),
         "file": str(output.as_posix()),
+        "source_numbers": [number],
     }
 
 
-def build_combined_backup(chapter_dir: Path, output: Path, start: int, end: int) -> None:
+def save_merged_chapters(
+    html: str,
+    source_url: str,
+    chapter_numbers: list[int],
+    chapter_dir: Path,
+) -> dict[int, dict]:
+    sections = split_merged_chapters(html, chapter_numbers)
+    saved: dict[int, dict] = {}
+
+    for number in chapter_numbers:
+        item = sections[number]
+        output = write_chapter_file(
+            chapter_dir,
+            number,
+            item["title"],
+            item["text"],
+        )
+        saved[number] = {
+            "number": number,
+            "url": source_url,
+            "final_url": source_url,
+            "status": 200,
+            "title": item["title"],
+            "bytes": output.stat().st_size,
+            "chars": len(item["text"]),
+            "sha256": sha256(output),
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+            "file": str(output.as_posix()),
+            "source_numbers": chapter_numbers,
+            "merged": True,
+        }
+    return saved
+
+
+def build_combined_backup(
+    chapter_dir: Path,
+    output: Path,
+    start: int,
+    end: int,
+) -> None:
     chunks: list[str] = []
     for number in range(start, end + 1):
         path = chapter_dir / f"{number}.txt"
@@ -354,57 +550,131 @@ def main() -> int:
 
     try:
         links = collect_chapter_links(
-            session, args.book_url, args.start, args.end,
-            timeout=args.timeout, retries=args.retries,
-            delay=args.delay, max_pages=args.max_pages,
+            session,
+            args.book_url,
+            args.start,
+            args.end,
+            timeout=args.timeout,
+            retries=args.retries,
+            delay=args.delay,
+            max_pages=args.max_pages,
         )
     except requests.RequestException as exc:
         print(f"Не удалось открыть книгу: {exc}", file=sys.stderr)
         return 1
 
-    print(f"Найдено глав: {len(links)}")
+    grouped = group_chapter_links(links)
+    found_numbers = sorted(links)
+
+    print(f"Найдено глав: {len(found_numbers)}")
+    print(f"Найдено страниц-источников: {len(grouped)}")
 
     manifest.setdefault("chapters", {})
     manifest.setdefault("missing", [])
     manifest.setdefault("errors", [])
 
-    missing = []
+    missing = [
+        number
+        for number in range(args.start, args.end + 1)
+        if number not in links
+    ]
     errors = []
 
-    for number in range(args.start, args.end + 1):
-        target = chapter_dir / f"{number}.txt"
-        if target.exists() and target.stat().st_size > 80:
-            print(f"[SKIP] {number}")
+    for source_url, chapter_numbers in grouped.items():
+        relevant = [
+            number for number in chapter_numbers
+            if args.start <= number <= args.end
+        ]
+        if not relevant:
             continue
 
-        url = links.get(number)
-        if not url:
-            print(f"[MISS] {number}")
-            missing.append(number)
+        if all(
+            (chapter_dir / f"{number}.txt").exists()
+            and (chapter_dir / f"{number}.txt").stat().st_size > MIN_CHAPTER_TEXT
+            for number in relevant
+        ):
+            print(f"[SKIP] {relevant} :: {source_url}")
             continue
 
         try:
-            print(f"[GET ] {number} {url}")
-            record = save_chapter(
-                session, number, url, chapter_dir,
-                timeout=args.timeout, retries=args.retries, delay=args.delay,
-            )
-            manifest["chapters"][str(number)] = record
+            if len(relevant) == 1:
+                number = relevant[0]
+                print(f"[GET ] {number} {source_url}")
+                record = save_chapter(
+                    session,
+                    number,
+                    source_url,
+                    chapter_dir,
+                    timeout=args.timeout,
+                    retries=args.retries,
+                    delay=args.delay,
+                )
+                manifest["chapters"][str(number)] = record
+            else:
+                print(
+                    f"[MERGED] source page: {source_url} -> "
+                    f"chapters {', '.join(map(str, relevant))}"
+                )
+                response = fetch(
+                    session,
+                    source_url,
+                    timeout=args.timeout,
+                    retries=args.retries,
+                    delay=args.delay,
+                )
+                records = save_merged_chapters(
+                    response.text,
+                    response.url,
+                    relevant,
+                    chapter_dir,
+                )
+                manifest["chapters"].update(
+                    {str(number): record for number, record in records.items()}
+                )
+                for number, record in records.items():
+                    print(
+                        f"[MERGED] chapter {number}: {record['chars']} chars"
+                    )
+
             save_manifest(manifest_path, manifest)
+
         except (requests.RequestException, ValueError, OSError) as exc:
-            print(f"[ERR ] {number} :: {exc}")
-            errors.append({"number": number, "url": url, "error": str(exc)})
+            for number in relevant:
+                target = chapter_dir / f"{number}.txt"
+                if target.exists() and target.stat().st_size <= MIN_CHAPTER_TEXT:
+                    target.unlink()
+
+            error_record = {
+                "url": source_url,
+                "chapter_numbers": relevant,
+                "type": type(exc).__name__,
+                "error": str(exc),
+                "at": datetime.now(timezone.utc).isoformat(),
+            }
+            errors.append(error_record)
+            manifest["errors"] = errors
+            save_manifest(manifest_path, manifest)
+            print(f"[ERR ] {relevant} :: {exc}", file=sys.stderr)
 
     manifest["missing"] = sorted(set(missing))
     manifest["errors"] = errors
     manifest["range"] = {"start": args.start, "end": args.end}
     manifest["source"] = args.book_url
+    manifest["stats"] = {
+        "expected_chapters": args.end - args.start + 1,
+        "found_chapters": len(found_numbers),
+        "source_pages": len(grouped),
+        "missing_chapters": len(missing),
+        "failed_sources": len(errors),
+    }
     manifest["updated_at"] = datetime.now(timezone.utc).isoformat()
     save_manifest(manifest_path, manifest)
 
     build_combined_backup(
-        chapter_dir, args.output / "backup.txt",
-        args.start, args.end,
+        chapter_dir,
+        args.output / "backup.txt",
+        args.start,
+        args.end,
     )
 
     saved = sum(
@@ -415,7 +685,7 @@ def main() -> int:
     print(f"Готово. Сохранено файлов: {saved}")
     print(f"Нет ссылок: {len(manifest['missing'])}")
     print(f"Ошибок: {len(manifest['errors'])}")
-    return 0
+    return 1 if errors or missing else 0
 
 
 if __name__ == "__main__":
