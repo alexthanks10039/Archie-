@@ -35,7 +35,7 @@ CHAPTER_PATTERNS = (
 CHAPTER_HEADING_PATTERN = re.compile(
     r"^(?:глава|chapter)\s*[#№]?\s*(\d+)"
     r"(?:\s*[-–—]\s*(\d+))?"
-    r"(?:\s*[:.].*)?$",
+    r"(?:\s*[-–—:]\s*.*)?$",
     re.I,
 )
 
