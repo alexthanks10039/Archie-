@@ -24,9 +24,11 @@ from backup import (
     build_combined_backup,
     collect_chapter_links,
     extract_text,
+    group_chapter_links,
     load_manifest,
     normalize_url,
     save_manifest,
+    save_merged_chapters,
     sha256,
 )
 
@@ -370,19 +372,24 @@ def main() -> int:
             logger.exception("Не удалось собрать ссылки на главы", exc)
             raise
 
-        logger.log(f"Найдено ссылок: {len(links)}")
+        grouped = group_chapter_links(links)
+        logger.log(f"Найдено глав: {len(links)}")
+        logger.log(f"Найдено страниц-источников: {len(grouped)}")
 
-        missing = []
-        pending = []
-        for number in range(args.start, args.end + 1):
-            url = links.get(number)
-            if not url:
-                missing.append(number)
-                logger.log(f"[MISS] {number}: ссылка не найдена", "WARN")
-            else:
-                pending.append((number, url))
+        missing = [
+            number
+            for number in range(args.start, args.end + 1)
+            if number not in links
+        ]
+        for number in missing:
+            logger.log(f"[MISS] {number}: ссылка не найдена", "WARN")
 
         manifest["missing"] = sorted(set(missing))
+        manifest["stats"] = {
+            "expected_chapters": args.end - args.start + 1,
+            "found_chapters": len(links),
+            "source_pages": len(grouped),
+        }
         manifest["range"] = {"start": args.start, "end": args.end}
         manifest["source"] = args.book_url
         save_manifest(manifest_path, manifest)
@@ -430,25 +437,73 @@ def main() -> int:
                 logger.exception("Playwright timeout during auth check", exc)
 
             errors = []
-            for index, (number, url) in enumerate(pending, start=1):
-                target = chapter_dir / f"{number}.txt"
+            source_items = list(grouped.items())
+            for source_index, (url, numbers) in enumerate(source_items, start=1):
+                relevant = [
+                    number
+                    for number in numbers
+                    if args.start <= number <= args.end
+                ]
+                if not relevant:
+                    continue
+
                 try:
-                    logger.log(f"[GET] {number} ({index}/{len(pending)}): {url}")
-                    record = save_browser_chapter(
-                        page,
-                        number,
-                        url,
-                        chapter_dir,
-                        timeout_ms=args.timeout * 1000,
-                        retries=args.retries,
-                        delay=args.delay,
-                        logger=logger,
-                    )
-                    manifest["chapters"][str(number)] = record
-                    save_manifest(manifest_path, manifest)
                     logger.log(
-                        f"[OK] {number}: {record['chars']} chars, {record['bytes']} bytes"
+                        f"[SOURCE] {source_index}/{len(source_items)} "
+                        f"chapters={relevant}: {url}"
                     )
+
+                    if len(relevant) == 1:
+                        number = relevant[0]
+                        target = chapter_dir / f"{number}.txt"
+                        record = save_browser_chapter(
+                            page,
+                            number,
+                            url,
+                            chapter_dir,
+                            timeout_ms=args.timeout * 1000,
+                            retries=args.retries,
+                            delay=args.delay,
+                            logger=logger,
+                        )
+                        manifest["chapters"][str(number)] = record
+                        logger.log(
+                            f"[OK] {number}: {record['chars']} chars, {record['bytes']} bytes"
+                        )
+                    else:
+                        logger.log(
+                            f"[MERGED] source page: {url}; "
+                            f"detected chapters: {', '.join(map(str, relevant))}"
+                        )
+                        response = fetch_with_browser(
+                            page,
+                            url,
+                            timeout_ms=args.timeout * 1000,
+                            retries=args.retries,
+                            delay=args.delay,
+                            logger=logger,
+                        )
+                        html = page.content()
+                        if contains_auth_warning(html):
+                            raise PermissionError(
+                                "iFreedom сообщает, что пользователь не авторизован."
+                            )
+
+                        records = save_merged_chapters(
+                            html,
+                            page.url,
+                            relevant,
+                            chapter_dir,
+                        )
+                        for number, record in records.items():
+                            manifest["chapters"][str(number)] = record
+                            logger.log(
+                                f"[MERGED] chapter {number}: "
+                                f"{record['chars']} chars, {record['bytes']} bytes"
+                            )
+
+                    save_manifest(manifest_path, manifest)
+
                 except (
                     PlaywrightTimeoutError,
                     PermissionError,
@@ -456,11 +511,9 @@ def main() -> int:
                     ValueError,
                     OSError,
                 ) as exc:
-                    if target.exists():
-                        target.unlink()
                     error_record = {
-                        "number": number,
                         "url": url,
+                        "chapter_numbers": relevant,
                         "type": type(exc).__name__,
                         "error": str(exc),
                         "traceback": traceback.format_exc(),
@@ -469,7 +522,10 @@ def main() -> int:
                     errors.append(error_record)
                     manifest["errors"] = errors
                     save_manifest(manifest_path, manifest)
-                    logger.exception(f"[ERR] Глава {number}", exc)
+                    logger.exception(
+                        f"[ERR] Source page for chapters {relevant}",
+                        exc,
+                    )
 
             manifest["missing"] = sorted(set(missing))
             manifest["errors"] = errors
