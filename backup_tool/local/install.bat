@@ -16,9 +16,6 @@ if errorlevel 1 goto :error
 python -m pip install -r requirements-browser.txt
 if errorlevel 1 goto :error
 
-python -m playwright install chromium
-if errorlevel 1 goto :error
-
 echo.
 echo Готово.
 echo Теперь запусти start_gui.bat
